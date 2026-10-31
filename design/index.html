@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f5f1">
+  <title>Aura · Prévia do design</title>
+  <link rel="icon" type="image/svg+xml" href="../public/favicon.svg">
+  <link rel="stylesheet" href="../public/styles.css">
+</head>
+<body data-preview="true">
+<div class="app" data-state="idle">
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-icon"></span><span class="brand-text">aura</span></div>
+    <div class="eyebrow">Seu espaço de conversa</div>
+    <nav class="nav" aria-label="Navegação principal">
+      <button class="active" data-page="conversation" aria-current="page"><span class="nav-symbol">◯</span><span class="nav-label">Conversa</span></button>
+      <button data-page="memory" aria-current="false"><span class="nav-symbol">◷</span><span class="nav-label">Memória</span></button>
+      <button data-page="settings" aria-current="false"><span class="nav-symbol">⚙</span><span class="nav-label">Configurações</span></button>
+    </nav>
+    <div class="sidebar-bottom"><p><span class="local-dot"></span>Pensado para rodar localmente</p><div class="sidebar-note">Uma conversa de cada vez.<br>Com calma. Com contexto.</div></div>
+  </aside>
+  <main class="workspace">
+    <header class="topbar"><div class="breadcrumb">Seu assistente<span>/ Aura</span></div><span class="pill">Prévia interativa · v0.1</span></header>
+    <div class="content">
+      <div class="demo-banner">Prévia de design: teste o microfone e reproduza um arquivo local. Para usar o agente, os modelos e o Google Calendar, abra o aplicativo Tauri com scripts/dev.sh.</div>
+      <section id="conversation" class="page" aria-label="Conversa">
+        <div class="page-heading"><div><div class="eyebrow">Aqui para ouvir</div><h1>Vamos conversar.</h1><div class="subtitle">Um espaço simples para encontrar respostas.</div></div><button class="text-button" data-action="new-session">+ Nova sessão</button></div>
+        <div class="voice-stage">
+          <div class="orb-scene" aria-hidden="true"><div class="orbit"></div><div class="orbit"></div><div class="orb"></div></div>
+          <div id="state-label" class="state-label">Pronta para começar</div>
+          <h2 id="stage-title" class="stage-title">Como posso ajudar?</h2>
+          <p id="stage-description" class="stage-description" role="status" aria-live="polite">Teste a entrada de áudio ou ouça uma amostra gerada por uma voz local.</p>
+          <div class="stage-controls">
+            <button id="mic-button" class="primary" aria-pressed="false"><span aria-hidden="true">●</span><span id="mic-label">Testar microfone</span></button>
+            <button id="sample-button" class="secondary">Ouvir amostra</button>
+            <button id="stop-button" class="round" aria-label="Parar áudio e liberar microfone">■</button>
+          </div>
+          <input type="file" id="sample-input" accept="audio/*" hidden>
+          <p class="fine-print">A amostra é um arquivo de áudio do seu computador. O teste não transcreve nem envia sua voz.</p>
+        </div>
+        <div class="configuration-row">
+          <div class="config-card"><span class="config-icon" aria-hidden="true">✧</span><div class="config-copy"><small>Modelo de suporte</small><strong>Nenhum modelo conectado</strong></div><span class="muted">↗</span></div>
+          <div class="config-card"><span class="config-icon" aria-hidden="true">≋</span><div class="config-copy"><small>Voz da resposta</small><label class="sr-only" for="voice-select">Voz da resposta</label><select id="voice-select" disabled><option>Instale uma voz para selecionar</option><option>Cadu · Piper · pt-BR</option><option>Faber · Piper · pt-BR</option></select></div></div>
+        </div>
+        <section class="conversation-preview" aria-label="Exemplo de transcrição">
+          <div class="section-header"><h2>A conversa, por escrito</h2><span class="fine-print">Exemplo de interface</span></div>
+          <div class="transcript-line"><span class="avatar">V</span><p><strong>Você</strong>Você lembra do problema de conexão que conversamos ontem?</p></div>
+          <div class="transcript-line"><span class="avatar">a</span><p><strong>Aura · exemplo</strong>Vou buscar a conversa anterior para entender o que já tentamos.</p></div>
+        </section>
+        <details class="fine-print"><summary>Visualizar estados da interface</summary><div class="preview-states"><button data-demo-state="idle">Pronta</button><button data-demo-state="listening">Escuta</button><button data-demo-state="transcribing">Transcrição</button><button data-demo-state="thinking">Pensando</button><button data-demo-state="searching">Pesquisando</button><button data-demo-state="speaking">Respondendo</button><button data-demo-state="error">Erro</button></div></details>
+      </section>
+      <section id="memory" class="page" hidden aria-label="Memória">
+        <div class="page-heading"><div><div class="eyebrow">Contexto que acompanha</div><h1>Sua memória.</h1><p class="subtitle" id="memory-description">Sessões locais e busca nas conversas anteriores.</p></div></div>
+        <div class="panel"><h2>Encontre uma conversa</h2><form id="memory-form"><label class="field" for="memory-query">O que você quer lembrar?<input id="memory-query" type="search" maxlength="2048" placeholder="Ex.: conexão, monitor, impressora"></label><button class="primary" type="submit">Buscar na memória</button></form><div id="memory-results" aria-live="polite"></div></div>
+        <div class="panel"><div class="section-header"><h2>Conversas</h2><button class="text-button" data-action="refresh-sessions">Atualizar</button></div><div id="session-list" aria-live="polite"></div></div>
+      </section>
+      <section id="settings" class="page" hidden aria-label="Configurações">
+        <div class="page-heading"><div><div class="eyebrow">Do seu jeito</div><h1>Uma voz. O seu modelo.</h1><p class="subtitle">Configuração prevista para o agente completo.</p></div></div>
+        <div class="panel"><h2>Modelo de suporte</h2><p class="subtitle">Ollama local ou provedor por API. O modelo será liberado após o teste de chat, streaming, português e ferramentas.</p><label class="field">Provedor<select disabled><option>Ollama · local</option><option>API compatível com Chat Completions</option></select></label><label class="field">Endereço local<input value="http://127.0.0.1:11434" readonly></label><button class="secondary" disabled>Configuração no aplicativo Tauri</button></div>
+        <div class="panel"><h2>Escolha como ouvir</h2><p class="subtitle">Vozes do aplicativo: Cadu e Faber, com síntese local pelo Piper. Abra o aplicativo para instalar e ouvir as vozes.</p><div class="model-list"><div class="model-item"><strong>Cadu</strong><small>Piper · Português brasileiro · pt_BR-cadu-medium</small><em>Instalação disponível no aplicativo Tauri</em></div><div class="model-item"><strong>Faber</strong><small>Piper · Português brasileiro · pt_BR-faber-medium</small><em>Instalação disponível no aplicativo Tauri</em></div></div></div>
+        <div class="panel"><h2>Áudio e privacidade</h2><p class="subtitle">Nesta prévia, o microfone só é aberto ao tocar em Testar microfone. Parar áudio encerra todas as faixas de captura. Nenhum áudio de teste é salvo.</p></div>
+      </section>
+      <footer class="footer"><span id="runtime-label">Prévia visual · sem modelo conectado</span><span>Áudio de teste processado nesta janela</span></footer>
+    </div>
+  </main>
+</div>
+<script type="module" src="../public/client.js"></script>
+</body>
+</html>

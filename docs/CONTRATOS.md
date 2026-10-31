@@ -1,0 +1,99 @@
+# Contratos de integração
+
+## Transporte
+
+O command Tauri `app_command` recebe `{command, args}` e responde sem eventos intermediários. O command `app_stream` recebe `{command, args, onEvent}`, onde `onEvent` é um `Channel<Value>` Tauri (obrigatório, não um objeto arbitrário serializado pela aplicação) que entrega eventos tipados antes da resposta final. `command` identifica uma operação da lista fechada abaixo; `args` usa snake_case e é validado por structs com campos desconhecidos recusados.
+
+Exemplo da ponte JS:
+
+```javascript
+const response = await window.__TAURI__.core.invoke('app_command', {
+  command: 'memory_search',
+  args: {query: 'reunião', session_id: null}
+});
+```
+
+Operações com eventos usam `app_stream` com `onEvent: new window.__TAURI__.core.Channel()`.
+
+A ponte Leptos encapsula essa chamada. O harness `aura-runtime` usa o mesmo dispatcher em NDJSON: `{id,command,args}` → `{id,result}` ou `{id,error}`. Não há servidor HTTP permanente. O listener loopback do OAuth existe somente durante autorização.
+
+## Operações
+
+| Grupo | Command | Entrada principal |
+|---|---|---|
+| Configuração | `settings_get` | `{}` |
+| Configuração | `settings_save` | `settings`, chaves opcionais `provider_key`, `brave_key`, `google_secret` |
+| Modelos | `provider_models`, `provider_probe`, `provider_status` | `{}`; usam a configuração salva |
+| Sessões | `session_create` | `title` |
+| Sessões | `session_list` | `before?` para paginação de 30 sessões |
+| Sessões | `session_messages` | `session_id`, `after?`; até 30 mensagens |
+| Sessões | `session_delete` | `session_id` |
+| Memória | `memory_search` | `query`, `session_id?`; até 8 resultados |
+| Conversa | `conversation_start` | `session_id`, `text?`; sem texto inicia voz automática; channel obrigatório |
+| Conversa | `conversation_finish_input`, `conversation_cancel` | `{}` |
+| Serviços | `service_list`, `service_status` | `{}` |
+| Serviços | `service_connect`, `service_disconnect` | `service_id` |
+| Conhecimento | `knowledge_refresh` | `service_id` |
+| Conhecimento | `knowledge_search` | `query` |
+| Fontes | `source_open` | `url`; HTTP/HTTPS sem credenciais, aberto no navegador do sistema |
+| Calendar | `calendar_list` | `{}` |
+| Calendar | `calendar_events` | `calendar_id`, `start`, `end`, `query?`, `page_token?` |
+| Calendar | `calendar_free_busy` | `calendar_ids`, `start`, `end` |
+| Proposta | `calendar_prepare_event` | `session_id`, `event` |
+| Operação | `action_get` | `session_id`; última operação, inclusive concluída |
+| Operação | `action_confirm`, `action_cancel`, `action_retry` | `id`, `session_id` |
+| Operação | `action_reconcile` | `id` |
+| Áudio | `audio_devices`, `model_status`, `voice_list` | `{}` |
+| Áudio | `model_install` | `id` do catálogo; channel opcional de progresso |
+| Áudio | `voice_preview` | `id` da voz instalada |
+
+Selecionar modelo é salvar a configuração e aprová-la em `provider_probe`; não há uma segunda seleção silenciosa. Os commands antigos de sessões, memória e `model_validate` continuam como aliases diretos Tauri para compatibilidade. `model_validate` continua sendo somente validação de flags; o aplicativo real usa o probe.
+
+Campos de credencial ausentes ou `null` preservam o segredo. Uma string vazia fornecida explicitamente ao backend remove o valor; a UI trata seu campo vazio como preservação. O retorno de settings não inclui segredos.
+
+## Eventos
+
+```json
+{
+  "session_id": 3,
+  "turn_id": "id-do-turno",
+  "generation": 8,
+  "sequence": 27,
+  "kind": "state.changed",
+  "payload": {"state": "consulting"}
+}
+```
+
+Tipos emitidos: `run.started`, `state.changed`, `transcript.final`, `tool.started`, `tool.completed`, `sources`, `assistant.delta`, `audio.level`, `audio.error`, `action.changed`, `turn.completed`, `turn.cancelled`, `error`, `run.completed`, `model.progress`.
+
+`audio.level` contém `rms` e origem `input`/`output`; o backend já considera o clock de reprodução. A UI ignora gerações e épocas locais obsoletas. A conclusão de um turno espera o stream final e o esvaziamento da fila de áudio. Cancelamento de uma conversa não desfaz operações externas confirmadas.
+
+## Eventos do Calendar e confirmação
+
+```json
+{
+  "calendar_id": "primary",
+  "summary": "Revisão do projeto",
+  "start": "2026-10-30T14:00:00",
+  "end": "2026-10-30T15:00:00",
+  "time_zone": "America/Bahia",
+  "all_day": false,
+  "description": ""
+}
+```
+
+Para eventos com horário, aceitam-se timestamps com offset ou horários civis resolvidos pelo fuso IANA. Horários ambíguos/inexistentes exigem esclarecimento. Para dia inteiro, `start` e `end` são datas ISO e `end` é exclusivo.
+
+A preparação retorna uma operação com ID, sessão, conta, proposta, estado, expiração e informações de disponibilidade. Nenhuma criação ocorre nessa etapa. Estados: `awaiting_confirmation`, `executing`, `completed`, `unknown`, `failed`, `cancelled`, `expired`.
+
+`action_confirm` faz claim atômico, verifica conta/sessão, revalida disponibilidade e cria no Google. Chamadas repetidas a uma operação concluída retornam seu resultado. Uma proposta substituída, expirada ou de outra conta não pode ser gravada. `action_retry` somente reabre uma operação desconhecida quando o mesmo evento não foi encontrado; não faz a gravação e exige nova confirmação.
+
+O LLM recebe apenas `calendar_prepare_event` e ferramentas de consulta. `action_confirm` pertence ao controle de UI/voz do aplicativo e não consta do catálogo de ferramentas do modelo.
+
+## Ferramentas comuns e erros
+
+`memory_search` do agente aceita `query`, `since?`, `until?`. Uma query vazia é permitida quando há filtro temporal. `conversation_get` recebe sessão e cursor; `knowledge_search` recebe query para o serviço ativo. `web_search` recebe query pública e recência opcional `pd`, `pw`, `pm` ou `py`.
+
+Erros possuem `{code,message,retryable}`. Entre os códigos: `AUTH_REQUIRED`, `OAUTH_DENIED`, `OAUTH_TIMEOUT`, `MODEL_NOT_VERIFIED`, `MODEL_INCOMPATIBLE`, `STREAM_TRUNCATED`, `CONTEXT_LIMIT`, `ACTION_NOT_CONFIRMABLE`, `AVAILABILITY_CHANGED`, `DEVICE_UNAVAILABLE`, `AUDIO_DEPENDENCIES`, `MODEL_NOT_INSTALLED`, `CANCELLED` e `COMMAND_NOT_ALLOWED`.
+
+Respostas HTTP e erros de banco não são expostos integralmente à UI. Fontes carregam IDs e metadados; resultados grandes são limitados e podem ser reduzidos no contexto enviado ao modelo. O cliente deve comunicar resultados desconhecidos sem convertê-los em sucesso ou em cancelamento garantido.

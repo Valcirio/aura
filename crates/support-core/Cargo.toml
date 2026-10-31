@@ -1,0 +1,13 @@
+[package]
+name = "support-core"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde_json = "1"
+jiff = { version = "0.2.38", default-features = false, features = ["std", "serde", "tz-system", "tzdb-zoneinfo"] }
+uuid = { version = "1", features = ["v4"] }

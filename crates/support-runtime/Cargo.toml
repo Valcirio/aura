@@ -1,0 +1,31 @@
+[package]
+name = "support-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = ["native-audio"]
+native-audio = ["dep:cpal"]
+
+[dependencies]
+support-core = { path = "../support-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "query", "form", "stream"] }
+futures-util = "0.3"
+sha2 = "0.10"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+jiff = { version = "0.2.38", default-features = false, features = ["std", "serde", "tz-system", "tzdb-zoneinfo"] }
+url = "2"
+webbrowser = "1"
+cpal = { version = "0.16", optional = true }
+html-escape = "0.2"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

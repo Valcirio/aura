@@ -1,0 +1,58 @@
+[package]
+name = "audio-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Out-of-app audio benchmarks (ASR/VAD/TTS) for the assistant"
+
+# Own (empty) workspace: this crate is NOT part of the root workspace (aura-ui).
+[workspace]
+
+[features]
+default = ["sherpa", "phonemize"]
+sherpa = ["dep:sherpa-onnx"]
+# piper-phonemize is GPL-3.0-or-later (espeak-ng). Bench-only; never ship it in the app.
+phonemize = ["dep:piper-phonemize"]
+# Whisper turbo on candle (CPU, default backend: no MKL/accelerate). Not in default features.
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sherpa-onnx = { version = "2.0.1", optional = true }
+piper-phonemize = { version = "1.5.9", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+
+[lib]
+name = "audio_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asr-sherpa"
+path = "src/bin/asr_sherpa.rs"
+required-features = ["sherpa"]
+
+[[bin]]
+name = "vad-sherpa"
+path = "src/bin/vad_sherpa.rs"
+required-features = ["sherpa"]
+
+[[bin]]
+name = "tts-sherpa"
+path = "src/bin/tts_sherpa.rs"
+required-features = ["sherpa", "phonemize"]
+
+[[bin]]
+name = "asr-candle"
+path = "src/bin/asr_candle.rs"
+required-features = ["candle"]
+
+[profile.release]
+opt-level = 3
+debug = false

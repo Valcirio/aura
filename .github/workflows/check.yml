@@ -1,0 +1,29 @@
+name: Linux checks
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/support-core
+            crates/support-runtime
+            src-tauri
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev librsvg2-dev patchelf
+      - run: cargo fmt --check && cargo fmt --manifest-path crates/support-core/Cargo.toml --check && cargo fmt --manifest-path crates/support-runtime/Cargo.toml --check && cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --locked --manifest-path crates/support-core/Cargo.toml
+      - run: cargo test --locked --manifest-path crates/support-runtime/Cargo.toml
+      - run: cargo check --locked --target wasm32-unknown-unknown
+      - run: cargo install trunk --locked && trunk build
+      - run: cargo check --manifest-path src-tauri/Cargo.toml
+      - run: python3 -m unittest discover -s workers -p 'test_*.py'
+      - run: cargo build --locked --manifest-path crates/support-runtime/Cargo.toml --bin aura-runtime && python3 scripts/verify-runtime.py
+      - run: node scripts/bridge.test.mjs
+      - run: node --check public/bridge.js && node --check public/client.js
