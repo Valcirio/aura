@@ -5,6 +5,10 @@ pub mod google;
 pub mod http;
 pub mod integrations;
 pub mod knowledge;
+#[cfg(feature = "local-speech")]
+pub mod local_speech;
+#[cfg(feature = "local-speech")]
+pub mod models;
 pub mod provider;
 pub mod runtime;
 pub mod secrets;

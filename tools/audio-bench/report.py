@@ -148,14 +148,16 @@ def main():
 
     # ---- TTS
     tts = load_runs(results, "tts-*.json")
-    md += ["## TTS (Piper pt_BR)", ""]
+    md += ["## TTS (pt-BR)", ""]
     if not tts:
         md += ["_nenhum resultado tts-*.json_", ""]
     else:
-        rows = [[get(r, "engine"), get(r, "voice"), get(r, "threads"), fnum(get(r, "load_ms"), 0),
-                 get(r, "sample_rate"), fnum(get(r, "mean_rtf"), 3), fnum(get(r, "peak_rss_mb"), 0)]
+        rows = [[get(r, "engine"), get(r, "voice"), get(r, "speaker") or "—", get(r, "threads"),
+                 fnum(get(r, "load_ms"), 0), get(r, "sample_rate"), fnum(get(r, "mean_rtf"), 3),
+                 fnum(get(r, "peak_rss_mb"), 0), get(r, "license") or "—"]
                 for r in tts]
-        md += [table(["engine", "voice", "threads", "load_ms", "sample rate", "mean RTF", "peak RSS MB"], rows), ""]
+        md += [table(["engine", "voice", "speaker", "threads", "load_ms", "sample rate", "mean RTF",
+                      "peak RSS MB", "license"], rows), ""]
         for r in tts:
             srows = [[s["idx"], s["chars"], fnum(s["audio_s"], 2), fnum(s["phonemize_ms"], 0),
                       fnum(s["synth_ms"], 0), fnum(s["rtf"], 3), fnum(s.get("rms"), 3)]

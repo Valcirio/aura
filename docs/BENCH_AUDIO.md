@@ -1,6 +1,6 @@
 # Benchmark de áudio local (Etapa 1)
 
-**Status:** medido em 30/10/2026. A recomendação da seção 8 está **pendente de aprovação do usuário**. Os dados brutos e o script de reprodução ficam em `tools/audio-bench/`; nenhum código do aplicativo foi alterado por esta etapa.
+**Status:** medido em 30/10/2026. O motor (sherpa-onnx) e o modelo de ASR (Whisper `turbo` int8) foram **aprovados** pelo usuário; a **voz** de TTS foi **aprovada**: Kokoro `pf_dora` com remap IPA (seção 8). Os dados brutos e o script de reprodução ficam em `tools/audio-bench/`; nenhum código do aplicativo foi alterado pela Etapa 1.
 
 ## 1. Objetivo e contexto
 
@@ -137,21 +137,68 @@ Ambas rodaram com 4 threads. Na frase mais longa (188 caracteres):
 
 A fonemização leva menos de 1 ms por frase. Os WAVs gerados ficam em `tools/audio-bench/data/out/*.wav` (nome `<voz>-NN.wav`) e a avaliação de naturalidade é auditiva, feita pelo usuário.
 
+Uma nova execução de referência do Cadu (30/10/2026, junto com as vozes femininas) deu RTF 0.038, load 524 ms e RSS 341 MB; a variação de cerca de 18% no RTF é ruído entre execuções.
+
 **Implicação de licença.** O `piper-phonemize` embute o espeak-ng e é **GPL-3.0-or-later**. O usuário já decidiu adotá-lo mesmo assim (Piper Cadu/Faber via sherpa-onnx + `piper-phonemize`). Isso implica cumprir a GPL-3 na distribuição do aplicativo: código-fonte disponível e aviso de licença no pacote `.deb`. Esse ponto será tratado na Etapa 4. No benchmark o fonemizador fica atrás da feature `phonemize`. Sem ela, o TTS não funciona, mas ASR e VAD continuam funcionando (`cargo build --release --no-default-features --features sherpa`). As vozes têm licenças próprias nos respectivos `MODEL_CARD`.
 
-## 8. Recomendação (pendente de aprovação do usuário)
+### 7.1 Vozes femininas (adendo)
 
-- **Motor:** sherpa-onnx para ASR, VAD e TTS, em processo único.
-- **ASR padrão:** Whisper `turbo` int8 com 8 threads (p95 de ~1,8 s, WER de 4%).
-- **Modo leve opcional:** Whisper `small` int8 com 4 threads.
+O Piper oficial pt_BR (cadu, faber, jeff, edresson) só tem vozes masculinas, e o usuário pediu uma voz feminina. Como a distribuição do aplicativo é comercial ou indefinida, licenças NC (não comercial) não podem ir para o produto.
+
+Candidatas e como cada uma roda:
+
+- **Dii:** Piper VITS `pt_BR-dii-high` (HF `csukuangfj/vits-piper-pt_BR-dii-high`, convertido de `OpenVoiceOS/pipertts_pt-BR_dii`), com o mesmo pipeline do Cadu/Faber.
+- **Kokoro v1.0 `pf_dora`** (sid 42; HF `csukuangfj/kokoro-multi-lang-v1_0`, só `model.onnx` fp32, `voices.bin` e `tokens.txt`): os fonemas IPA do `piper-phonemize` (pt-br) são passados como `phoneme_codepoints`, sem lexicon nem espeak interno. Há um remap opcional `tʃ→ʧ`, `dʒ→ʤ` (convenção do misaki, o frontend do Kokoro). Com e sem remap os áudios diferem (duração e conteúdo), então qual ficou melhor dependia de ouvir; a variante **com remap** foi posteriormente aprovada.
+- **Supertonic-3 int8** (HF `csukuangfj2/sherpa-onnx-supertonic-3-tts-int8-2026-05-11`): modelo de difusão que lê o texto direto (`extra={"lang":"pt"}`, `num_steps` 8), sem fonemizador. Os sids 0–4 correspondem a F1–F5 (fonte: README do re-host; a confirmar ouvindo).
+
+Medições com 4 threads, em CPU:
+
+| voz | modelo | sample rate | load ms | RTF médio | RSS MB | frase 188 car. (síntese / áudio) | licença | elegível p/ produto |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Dii | Piper VITS high | 22050 | 793 | 0.032 | 325 | 325 ms / 9.9 s | CC BY-NC (não comercial) | Não |
+| Kokoro pf_dora (com remap) | Kokoro v1.0 fp32 | 24000 | 706 | 0.232 | 636 | 2505 ms / 10.0 s | Apache-2.0 | Sim |
+| Kokoro pf_dora (sem remap) | Kokoro v1.0 fp32 | 24000 | 682 | 0.243 | 635 | — | Apache-2.0 | Sim |
+| Supertonic F1 (sid 0) | Supertonic-3 int8 | 44100 | 416 | 0.187 | 312 | 2475 ms / 14.0 s | OpenRAIL-M | Sim, com ressalvas |
+| Supertonic F2 (sid 1) | Supertonic-3 int8 | 44100 | 431 | 0.194 | 301 | — | OpenRAIL-M | Sim, com ressalvas |
+| Supertonic F3 (sid 2) | Supertonic-3 int8 | 44100 | 411 | 0.191 | 314 | — | OpenRAIL-M | Sim, com ressalvas |
+| Supertonic F4 (sid 3) | Supertonic-3 int8 | 44100 | 421 | 0.205 | 300 | — | OpenRAIL-M | Sim, com ressalvas |
+| Supertonic F5 (sid 4) | Supertonic-3 int8 | 44100 | 433 | 0.192 | 314 | — | OpenRAIL-M | Sim, com ressalvas |
+
+Observações:
+
+- Nenhum áudio saiu mudo (RMS ≥ 0,047 em todas as frases).
+- Kokoro e Supertonic têm RTF ~0,19–0,24, cerca de 6x mais lentos que o Piper, mas ainda bem abaixo de tempo real. A frase longa leva ~2,5 s, então na integração (Etapa 3) a síntese deve ser feita frase a frase, em pipeline com a reprodução, para a primeira fala sair rápido.
+- O Supertonic gera 44,1 kHz: o player precisa reamostrar ou aceitar essa taxa.
+- O Kokoro fp32 ocupa ~325 MB em disco. Existe uma versão int8 (~114 MB) que não foi medida (há relato de terceiros de que ela gera NaN em pt-BR).
+- **Licenças.** O Kokoro-82M é Apache-2.0 (LICENSE baixado do repositório). No Supertonic, o código é MIT e o modelo é OpenRAIL-M, que traz restrições de uso (lista de usos proibidos) e exige repassar essas restrições a quem recebe o modelo; avaliar antes de distribuir. O Dii é CC BY-NC e está fora do produto: serve só como referência de qualidade.
+
+WAVs para ouvir: `tools/audio-bench/data/out/{dii,kokoro-dora,kokoro-dora-noremap,supertonic-sid0..4}-01..05.wav`, mais `cadu-NN.wav` e `faber-NN.wav` para comparar.
+
+Reprodução (a partir de `tools/audio-bench`):
+
+```bash
+python3 fetch.py
+./target/release/tts-sherpa --voice dii --threads 4 --out-dir data/out
+./target/release/tts-sherpa --voice kokoro-dora [--no-remap] --threads 4 --out-dir data/out
+./target/release/tts-sherpa --voice supertonic --sid N --num-steps 8 --threads 4 --out-dir data/out
+python3 report.py
+```
+
+## 8. Decisões
+
+Status: motor sherpa-onnx, ASR padrão e modo leve **aprovados** em 30/10/2026; a voz padrão de TTS (Kokoro `pf_dora` com remap) foi **aprovada**.
+
+- **Motor:** sherpa-onnx para ASR, VAD e TTS, em processo único. **Aprovado** (30/10/2026).
+- **ASR padrão:** Whisper `turbo` int8 com 8 threads (p95 de ~1,8 s, WER de 4%). **Aprovado.**
+- **Modo leve opcional:** Whisper `small` int8 com 4 threads, com aviso na UI. **Aprovado.**
   - RAM de ~0,9 GB e p50 cerca de 20% menor (1282 contra 1583 ms).
   - WER de 23%. A UI deve avisar claramente que a precisão cai.
-- **Voz padrão de TTS:** deixar o usuário escolher entre Cadu e Faber. Ambas têm RTF < 0,05 e a escolha é subjetiva (naturalidade).
-- **RAM residente estimada** com `turbo` + VAD + uma voz: **≈ 2,1 GB** (1772 + 54 + 346 = 2172 MB). É uma soma de picos, então é um limite superior aproximado.
+- **Voz padrão de TTS:** **Kokoro v1.0 fp32 `pf_dora`, sid 42, com remap `tʃ→ʧ` e `dʒ→ʤ`, aprovado.** O Dii fica excluído por ser CC BY-NC.
+- **RAM residente estimada** com `turbo` + VAD + uma voz Piper: **≈ 2,1 GB** (1772 + 54 + 346 = 2172 MB). Com Kokoro no lugar do Piper, a RAM residente sobe para **~2,5 GB** (1772 + 54 + 636 = 2462 MB). São somas de picos, então são limites superiores aproximados.
 - **Orçamento de latência.** A latência de ~1,6 s por transcrição é dominada pelo padding da janela fixa de 30 s do Whisper, não pela duração da fala. Otimizações futuras (por exemplo, janelas menores ou outros modelos) estão fora do escopo desta etapa.
 
 ## 9. Próximos passos
 
-- **Etapa 2:** implementar o `LocalSpeech` nativo em `support-runtime`, sob a feature `local-speech`.
-- **Etapa 3:** integrar o `LocalSpeech` ao aplicativo e às seleções de modelo e voz na UI.
-- **Etapa 4:** limpeza, removendo o worker Python e seus artefatos.
+- **Etapa 2:** concluída. `LocalSpeech` nativo em `support-runtime`, sob a feature opt-in `local-speech`.
+- **Etapa 3 (pendente de aprovação):** integrar o `LocalSpeech` ao aplicativo e às seleções de modelo e voz na UI.
+- **Etapa 4 (futura):** limpeza, removendo o worker Python e seus artefatos.

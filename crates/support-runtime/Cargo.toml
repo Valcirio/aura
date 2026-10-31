@@ -8,6 +8,7 @@ edition = "2024"
 [features]
 default = ["native-audio"]
 native-audio = ["dep:cpal"]
+local-speech = ["dep:sherpa-onnx", "dep:piper-phonemize", "dep:ort", "dep:ort-sys"]
 
 [dependencies]
 support-core = { path = "../support-core" }
@@ -26,6 +27,10 @@ webbrowser = "1"
 cpal = { version = "0.16", optional = true }
 html-escape = "0.2"
 async-trait = "0.1"
+sherpa-onnx = { version = "=2.0.1", optional = true }
+piper-phonemize = { version = "=1.5.9", optional = true }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std"], optional = true }
+ort-sys = { version = "=2.0.0-rc.10", default-features = false, features = ["disable-linking"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

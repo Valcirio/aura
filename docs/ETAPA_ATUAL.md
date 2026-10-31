@@ -1,8 +1,15 @@
 # Etapa atual e próxima implementação
 
-Atualizado em **29/10/2026**. Este documento orienta a continuidade do desenvolvimento com base no [plano](PLANO.md), na [arquitetura](ARQUITETURA.md) e nas evidências do [registro de validação](VALIDACAO.md). O plano define os critérios de aceitação; a arquitetura define os limites entre os componentes.
+Atualizado em **31/10/2026**. Este documento orienta a continuidade do desenvolvimento com base no [plano](PLANO.md), na [arquitetura](ARQUITETURA.md) e nas evidências do [registro de validação](VALIDACAO.md). O plano define os critérios de aceitação; a arquitetura define os limites entre os componentes.
 
 ## Etapa atual
+
+> **Nota de status (31/10/2026).** A Etapa 2 nativa está concluída: `LocalSpeech` em `support-runtime`, disponível apenas com a feature `local-speech`, ainda não integrado ao runtime de áudio nem à UI. O caminho da aplicação continua usando o worker Python.
+>
+> - Whisper `turbo` int8 com 8 threads é o padrão; `small` int8 com 4 threads é selecionável via `AsrModel`. VAD Silero e Kokoro fp32 `pf_dora`, sid 42, com remap IPA pt-BR estão implementados.
+> - Validação: `cargo test --manifest-path crates/support-runtime/Cargo.toml --features local-speech -- --include-ignored --nocapture --test-threads=1` resultou em **45 aprovados, 0 ignorados**; testes padrão: **13 aprovados**; formatação limpa.
+> - A Etapa 3, integração ao aplicativo, está pendente de aprovação do usuário.
+> - O texto abaixo é planejamento e validação operacional anteriores, não uma descrição atualizada da implementação nativa.
 
 O projeto está na **integração e validação operacional do MVP Linux**. Os principais componentes estão implementados e possuem testes locais, mas a experiência completa na janela Tauri ainda precisa ser demonstrada em uma máquina com rede, modelos, dispositivos de áudio e credenciais configurados.
 
@@ -56,7 +63,7 @@ O smoke automatizado deve funcionar sem credenciais de produção nem gravaçõe
 
 ## Limites arquiteturais a preservar
 
-O áudio continua no runtime Rust/CPAL; o worker Python mantém a inferência e a instalação dos modelos. PCM não deve atravessar a WebView. Leptos controla a interface e recebe eventos pelo dispatcher Tauri.
+O áudio continua no runtime Rust/CPAL; o worker Python mantém a inferência e a instalação dos modelos. O `LocalSpeech` nativo (feature opt-in `local-speech`) ainda não está integrado; a aplicação usa o worker Python. PCM não deve atravessar a WebView. Leptos controla a interface e recebe eventos pelo dispatcher Tauri.
 
 Novos serviços devem usar `ServiceAdapter` e `ServiceExecutor`, mantendo o coordenador e o pipeline de áudio independentes dos produtos. Nesta etapa, o serviço funcional permanece o Google Calendar, com uma conta conectada por vez.
 
@@ -83,6 +90,6 @@ No ambiente preparado, execute também `cargo check --locked --target wasm32-unk
 
 Após aprovar os critérios acima, avance para **distribuição e avaliação de desempenho em Linux**: gerar DEB/AppImage com `scripts/build-linux.sh`, testar instalação limpa/atualização e registrar as medições definidas no plano. As metas são p95 de até cinco segundos até o primeiro áudio sem ferramentas, 200 ms para parada explícita, 150 ms para busca em dez mil mensagens e cem turnos reais sem crescimento contínuo de recursos. Todas ainda precisam ser medidas.
 
-Expansões de produto devem ser priorizadas depois desses critérios. Windows/macOS, múltiplas contas simultâneas, interrupção natural com cancelamento de eco, edição/exclusão de eventos, convites, novas recorrências, Meet, Kokoro e embeddings continuam fora do MVP, conforme PLANO.md.
+Expansões de produto devem ser priorizadas depois desses critérios. Windows/macOS, múltiplas contas simultâneas, interrupção natural com cancelamento de eco, edição/exclusão de eventos, convites, novas recorrências, Meet e embeddings continuam fora do MVP, conforme PLANO.md.
 
 Ao concluir cada entrega, atualize este documento e VALIDACAO.md. Mudanças de escopo ou de componentes também devem ser refletidas em PLANO.md e ARQUITETURA.md, preservando a distinção entre código implementado, verificação automatizada e validação operacional.
