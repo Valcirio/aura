@@ -6,7 +6,7 @@ edition = "2024"
 [workspace]
 
 [features]
-default = ["native-audio"]
+default = ["native-audio", "local-speech"]
 native-audio = ["dep:cpal"]
 local-speech = ["dep:sherpa-onnx", "dep:piper-phonemize", "dep:ort", "dep:ort-sys"]
 

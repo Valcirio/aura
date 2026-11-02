@@ -28,7 +28,6 @@
     "active": true,
     "targets": ["deb", "appimage"],
     "icon": ["icons/icon.png"],
-    "resources": {"../workers/": "workers/"},
     "linux": {"deb": {"depends": ["libasound2", "libespeak-ng1", "libsecret-tools", "tzdata"]}}
   }
 }

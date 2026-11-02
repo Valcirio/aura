@@ -75,6 +75,7 @@ pub struct Settings {
     pub service_id: String,
     pub provider: ProviderConfig,
     pub voice: String,
+    pub asr_model: String,
     pub speed: f32,
     pub time_zone: String,
     pub calendar_id: String,
@@ -88,7 +89,8 @@ impl Default for Settings {
         Self {
             service_id: "google_calendar".into(),
             provider: ProviderConfig::default(),
-            voice: "pt_BR-cadu-medium".into(),
+            voice: "pf_dora".into(),
+            asr_model: "turbo".into(),
             speed: 1.,
             time_zone: jiff::tz::TimeZone::system()
                 .iana_name()
@@ -103,15 +105,24 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    /// Maps legacy Piper voice identifiers found in persisted settings to the native voice.
+    pub fn migrate_loaded(&mut self) {
+        if ["pt_BR-cadu-medium", "pt_BR-faber-medium"].contains(&self.voice.as_str()) {
+            self.voice = "pf_dora".into();
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         self.provider.validate()?;
         jiff::tz::TimeZone::get(&self.time_zone)
             .map_err(|_| AppError::invalid("Fuso desconhecido"))?;
-        if !["pt_BR-cadu-medium", "pt_BR-faber-medium"].contains(&self.voice.as_str())
+        if self.voice != "pf_dora"
+            || !["turbo", "small"].contains(&self.asr_model.as_str())
             || !(0.85..=1.15).contains(&self.speed)
             || !self.speed.is_finite()
         {
-            return Err(AppError::invalid("Voz ou velocidade inválida"));
+            return Err(AppError::invalid(
+                "Voz, modelo de transcrição ou velocidade inválida",
+            ));
         }
         Ok(())
     }
@@ -149,6 +160,15 @@ impl Paths {
     pub fn models(&self) -> PathBuf {
         self.data.join("models")
     }
+    /// Local directory with `<artifact id>/<file>` copies that may seed model
+    /// installation (always verified against the catalog before use). Never a URL.
+    pub fn model_source_root(&self) -> Option<PathBuf> {
+        if let Some(root) = std::env::var_os("AURA_MODEL_SOURCE_ROOT") {
+            return Some(PathBuf::from(root));
+        }
+        let bench = self.resources.join("tools/audio-bench/data/models");
+        bench.is_dir().then_some(bench)
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +183,53 @@ mod tests {
         assert!(c.validate().is_err());
         c.base_url = "https://example.com/v1".into();
         assert!(c.validate().is_ok());
+    }
+    #[test]
+    fn missing_fields_use_defaults() {
+        let s: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(s.voice, "pf_dora");
+        assert_eq!(s.asr_model, "turbo");
+        let s: Settings =
+            serde_json::from_value(serde_json::json!({"voice":"pt_BR-faber-medium"})).unwrap();
+        assert_eq!(s.asr_model, "turbo");
+    }
+    #[test]
+    fn legacy_voices_migrate_on_load_only() {
+        for legacy in ["pt_BR-cadu-medium", "pt_BR-faber-medium"] {
+            let mut s = Settings {
+                voice: legacy.into(),
+                ..Settings::default()
+            };
+            assert!(s.validate().is_err());
+            s.migrate_loaded();
+            assert_eq!(s.voice, "pf_dora");
+            assert!(s.validate().is_ok());
+        }
+        let mut s = Settings {
+            voice: "other".into(),
+            ..Settings::default()
+        };
+        s.migrate_loaded();
+        assert_eq!(s.voice, "other");
+    }
+    #[test]
+    fn rejects_unknown_voice_and_asr() {
+        let s = Settings {
+            voice: "x".into(),
+            ..Settings::default()
+        };
+        assert_eq!(s.validate().unwrap_err().code, "INVALID_INPUT");
+        let s = Settings {
+            asr_model: "large".into(),
+            ..Settings::default()
+        };
+        assert_eq!(s.validate().unwrap_err().code, "INVALID_INPUT");
+        for m in ["turbo", "small"] {
+            let s = Settings {
+                asr_model: m.into(),
+                ..Settings::default()
+            };
+            assert!(s.validate().is_ok());
+        }
     }
 }

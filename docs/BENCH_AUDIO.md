@@ -4,7 +4,7 @@
 
 ## 1. Objetivo e contexto
 
-Hoje a fala (STT, VAD e TTS) roda em um worker Python persistente, conforme [MODELOS.md](MODELOS.md). A migração planejada troca esse worker por motores Rust **in-process**:
+Na linha de base histórica da Etapa 1, a fala (STT, VAD e TTS) rodava em um worker Python persistente, conforme [MODELOS.md](MODELOS.md). A migração planejada troca esse worker por motores Rust **in-process**:
 
 - **STT:** Whisper.
 - **VAD:** Silero.
@@ -184,6 +184,28 @@ python3 fetch.py
 python3 report.py
 ```
 
+### 7.2 Avisos pré-gravados (pt-BR)
+
+Quatro avisos fixos ficam embutidos no `support-runtime` (`crates/support-runtime/assets/notices/*.wav`) e tocam sem modelos de fala instalados:
+
+| arquivo | texto |
+| --- | --- |
+| `provider.wav` | Configure o provedor para continuar. |
+| `models.wav` | Os modelos de fala ainda não estão prontos. |
+| `capture.wav` | Não foi possível usar o microfone. Verifique o dispositivo. |
+| `synthesis.wav` | Não foi possível gerar a resposta falada. |
+
+- **Geração (offline):** `tts-sherpa --voice kokoro-dora --models-dir data/models --notice-text "<texto>" --notice-output <arquivo.wav>`. O modo exige `--voice kokoro-dora`, usa o remap `tʃ→ʧ`/`dʒ→ʤ` e o speaker 42 (`pf_dora`), rejeita `--no-remap` e outro `--sid`, grava só o WAV e não roda as frases do benchmark.
+- **Voz:** Kokoro v1.0 fp32 `pf_dora`, sid 42, com remap; velocidade 1.0.
+- **Formato:** WAV mono, PCM 16 bits, 24000 Hz.
+- **Modelos usados (SHA-256 conferidos contra o catálogo de `models.rs` antes de gerar):**
+  - `model.onnx`: `b40f62b166ac8164b0627ef48a0b358eda0985e272fb03ef5252e7206305da11`
+  - `voices.bin`: `1c5a5b983d3d50d8586d437a51f3faa2da7919ce76a013c081e65671a3447c29`
+  - `tokens.txt`: `6ebb6bb288f20f3ae8d004d3c2ca27697da27c037d75e81a60e2a6a663f95425`
+  - `LICENSE`: `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`
+- **Proveniência:** gerados em 01/11/2026 com o `tts-sherpa` do bench (sherpa-onnx + `piper-phonemize`), a partir dos arquivos locais em `tools/audio-bench/data/models/kokoro-multi-lang-v1_0`; nenhum modelo foi baixado nem versionado.
+- **Licenças:** o modelo Kokoro é Apache-2.0. O fonemizador `piper-phonemize` (espeak-ng) usado na geração é **GPL-3.0-or-later**; a cadeia de ferramentas do bench, portanto, não é toda Apache-2.0. Ver a implicação de licença na seção 7 e o `tools/audio-bench/README.md`.
+
 ## 8. Decisões
 
 Status: motor sherpa-onnx, ASR padrão e modo leve **aprovados** em 30/10/2026; a voz padrão de TTS (Kokoro `pf_dora` com remap) foi **aprovada**.
@@ -200,5 +222,5 @@ Status: motor sherpa-onnx, ASR padrão e modo leve **aprovados** em 30/10/2026; 
 ## 9. Próximos passos
 
 - **Etapa 2:** concluída. `LocalSpeech` nativo em `support-runtime`, sob a feature opt-in `local-speech`.
-- **Etapa 3 (pendente de aprovação):** integrar o `LocalSpeech` ao aplicativo e às seleções de modelo e voz na UI.
-- **Etapa 4 (futura):** limpeza, removendo o worker Python e seus artefatos.
+- **Etapa 3:** concluída. `LocalSpeech` integrado ao runtime e à UI, habilitado por padrão, com seleção de modelo e voz; o worker Python fica fora do bundle Tauri.
+- **Etapa 4 (pendente de aprovação):** limpeza, removendo o worker Python e seus artefatos.

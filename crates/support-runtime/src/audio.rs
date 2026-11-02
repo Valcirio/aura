@@ -1,11 +1,13 @@
 use crate::{
     AppError, Result,
-    speech::{Pcm, SpeechWorker},
+    speech::{Pcm, SpeechBackend},
 };
 use serde::Serialize;
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "native-audio")]
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -121,15 +123,27 @@ mod native {
                 },
                 None,
             )
-            .map_err(|_| {
-                AppError::new(
-                    "MIC_PERMISSION_DENIED",
-                    "Não foi possível abrir o microfone. Verifique permissão e dispositivo.",
-                )
-            })
+            .map_err(|error| classify_input_error(&error))
+    }
+    pub(super) fn classify_input_error(error: &cpal::BuildStreamError) -> AppError {
+        match error {
+            cpal::BuildStreamError::DeviceNotAvailable => AppError::new(
+                "DEVICE_UNAVAILABLE",
+                "Microfone indisponível. Conecte ou selecione outro dispositivo de entrada em Configurações.",
+            ),
+            cpal::BuildStreamError::StreamConfigNotSupported
+            | cpal::BuildStreamError::InvalidArgument => AppError::new(
+                "AUDIO_FORMAT",
+                "O microfone não aceita o formato necessário. Selecione outro dispositivo de entrada.",
+            ),
+            _ => AppError::new(
+                "MIC_OPEN_FAILED",
+                "Não foi possível abrir o microfone. Verifique se o sistema permite o acesso, se outro aplicativo não o está usando e se o dispositivo de entrada está correto.",
+            ),
+        }
     }
     pub fn capture(
-        worker: &SpeechWorker,
+        worker: &SpeechBackend,
         input: Option<&str>,
         cancel: &CancellationToken,
         finish: &AtomicBool,
@@ -384,6 +398,90 @@ mod native {
         }
     }
 }
+const WAV_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Decodes an embedded mono PCM16 RIFF/WAVE asset into native `Pcm`.
+pub fn decode_wav_pcm16(bytes: &[u8], expected_rate: u32) -> Result<Pcm> {
+    fn bad(message: &str) -> AppError {
+        AppError::new(
+            "AUDIO_FORMAT",
+            format!("Áudio embutido inválido: {message}"),
+        )
+    }
+    fn u16_at(bytes: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([bytes[at], bytes[at + 1]])
+    }
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    }
+    if bytes.len() < 12 || bytes.len() > WAV_MAX_BYTES {
+        return Err(bad("tamanho"));
+    }
+    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(bad("cabeçalho RIFF"));
+    }
+    if u32_at(bytes, 4) as usize != bytes.len() - 8 {
+        return Err(bad("tamanho RIFF"));
+    }
+    let mut offset = 12;
+    let mut format_seen = false;
+    let mut data: Option<&[u8]> = None;
+    while offset + 8 <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let size = u32_at(bytes, offset + 4) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(size).filter(|end| *end <= bytes.len());
+        let Some(end) = end else {
+            return Err(bad("bloco truncado"));
+        };
+        match id {
+            b"fmt " => {
+                if format_seen || size < 16 {
+                    return Err(bad("bloco fmt"));
+                }
+                let tag = u16_at(bytes, start);
+                let channels = u16_at(bytes, start + 2);
+                let rate = u32_at(bytes, start + 4);
+                let byte_rate = u32_at(bytes, start + 8);
+                let align = u16_at(bytes, start + 12);
+                let bits = u16_at(bytes, start + 14);
+                if tag != 1 || bits != 16 {
+                    return Err(bad("esperado PCM de 16 bits"));
+                }
+                if channels != 1 {
+                    return Err(bad("esperado áudio mono"));
+                }
+                if rate != expected_rate {
+                    return Err(bad("taxa de amostragem inesperada"));
+                }
+                if align != 2 || byte_rate != rate * 2 {
+                    return Err(bad("alinhamento"));
+                }
+                format_seen = true;
+            }
+            b"data" => {
+                if !format_seen || data.is_some() {
+                    return Err(bad("bloco data"));
+                }
+                data = Some(&bytes[start..end]);
+            }
+            _ => {}
+        }
+        offset = end + (size & 1);
+    }
+    let data = data.ok_or_else(|| bad("sem dados"))?;
+    if data.is_empty() || data.len() % 2 != 0 {
+        return Err(bad("dados desalinhados"));
+    }
+    let samples = data
+        .chunks_exact(2)
+        .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.)
+        .collect();
+    Ok(Pcm {
+        sample_rate: expected_rate,
+        samples,
+    })
+}
 pub fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         0.
@@ -399,7 +497,7 @@ pub fn devices() -> Result<Vec<AudioDevice>> {
 }
 #[cfg(not(feature = "native-audio"))]
 pub fn capture(
-    _: &SpeechWorker,
+    _: &SpeechBackend,
     _: Option<&str>,
     _: &CancellationToken,
     _: &AtomicBool,
@@ -411,4 +509,76 @@ pub fn capture(
 #[cfg(not(feature = "native-audio"))]
 pub fn play(_: Pcm, _: Option<&str>, _: &CancellationToken, _: impl FnMut(f32)) -> Result<()> {
     Err(AppError::new("AUDIO_UNAVAILABLE", "Build sem áudio nativo"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wav(rate: u32, channels: u16, bits: u16, tag: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = b"RIFF".to_vec();
+        out.extend(((36 + data.len()) as u32).to_le_bytes());
+        out.extend(b"WAVEfmt ");
+        out.extend(16u32.to_le_bytes());
+        out.extend(tag.to_le_bytes());
+        out.extend(channels.to_le_bytes());
+        out.extend(rate.to_le_bytes());
+        out.extend((rate * u32::from(channels) * u32::from(bits / 8)).to_le_bytes());
+        out.extend((channels * (bits / 8)).to_le_bytes());
+        out.extend(bits.to_le_bytes());
+        out.extend(b"data");
+        out.extend((data.len() as u32).to_le_bytes());
+        out.extend(data);
+        out
+    }
+
+    #[test]
+    fn decodes_valid_pcm16() {
+        let pcm =
+            decode_wav_pcm16(&wav(24000, 1, 16, 1, &[0, 0, 0, 0x40, 0, 0xc0]), 24000).unwrap();
+        assert_eq!(pcm.sample_rate, 24000);
+        assert_eq!(pcm.samples, vec![0., 0.5, -0.5]);
+    }
+
+    #[test]
+    fn rejects_malformed_wav() {
+        let good = wav(24000, 1, 16, 1, &[1, 0, 2, 0]);
+        assert!(decode_wav_pcm16(&good, 24000).is_ok());
+        assert!(decode_wav_pcm16(&good, 16000).is_err());
+        assert!(decode_wav_pcm16(&[], 24000).is_err());
+        assert!(decode_wav_pcm16(&good[..20], 24000).is_err());
+        assert!(decode_wav_pcm16(&good[..good.len() - 1], 24000).is_err());
+        assert!(decode_wav_pcm16(&wav(24000, 2, 16, 1, &[0; 8]), 24000).is_err());
+        assert!(decode_wav_pcm16(&wav(24000, 1, 8, 1, &[0; 4]), 24000).is_err());
+        assert!(decode_wav_pcm16(&wav(24000, 1, 16, 3, &[0; 4]), 24000).is_err());
+        assert!(decode_wav_pcm16(&wav(24000, 1, 16, 1, &[]), 24000).is_err());
+        assert!(decode_wav_pcm16(&wav(24000, 1, 16, 1, &[0; 3]), 24000).is_err());
+        let mut bad_magic = good.clone();
+        bad_magic[0] = b'X';
+        assert!(decode_wav_pcm16(&bad_magic, 24000).is_err());
+        let mut oversized = good.clone();
+        oversized[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_wav_pcm16(&oversized, 24000).is_err());
+        let mut missing_fmt = b"RIFF".to_vec();
+        missing_fmt.extend(20u32.to_le_bytes());
+        missing_fmt.extend(b"WAVEdata");
+        missing_fmt.extend(4u32.to_le_bytes());
+        missing_fmt.extend([0; 4]);
+        assert!(decode_wav_pcm16(&missing_fmt, 24000).is_err());
+    }
+
+    #[cfg(feature = "native-audio")]
+    #[test]
+    fn input_errors_are_not_all_permission_denials() {
+        use cpal::BuildStreamError as E;
+        let unavailable = native::classify_input_error(&E::DeviceNotAvailable);
+        assert_eq!(unavailable.code, "DEVICE_UNAVAILABLE");
+        let format = native::classify_input_error(&E::StreamConfigNotSupported);
+        assert_eq!(format.code, "AUDIO_FORMAT");
+        let other = native::classify_input_error(&E::StreamIdOverflow);
+        assert_eq!(other.code, "MIC_OPEN_FAILED");
+        assert_ne!(other.code, "MIC_PERMISSION_DENIED");
+        assert!(other.message.contains("permite o acesso"));
+        assert!(other.message.contains("dispositivo de entrada"));
+    }
 }

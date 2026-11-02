@@ -84,6 +84,15 @@ impl Memory {
         self.connection.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,serde_json::to_string(value)?])?;
         Ok(())
     }
+    /// Writes several settings entries atomically.
+    pub fn set_json_many(&self, entries: &[(&str, &Value)]) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        for (key, value) in entries {
+            tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,serde_json::to_string(value)?])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn get_json(&self, key: &str) -> Result<Option<Value>> {
         let value: Option<String> = self
             .connection

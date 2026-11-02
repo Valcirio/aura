@@ -23,7 +23,7 @@ A ponte Leptos encapsula essa chamada. O harness `aura-runtime` usa o mesmo disp
 |---|---|---|
 | Configuração | `settings_get` | `{}` |
 | Configuração | `settings_save` | `settings`, chaves opcionais `provider_key`, `brave_key`, `google_secret` |
-| Modelos | `provider_models`, `provider_probe`, `provider_status` | `{}`; usam a configuração salva |
+| Modelos | `provider_models`, `provider_probe`, `provider_check`, `provider_status` | `{}`; usam a configuração salva |
 | Sessões | `session_create` | `title` |
 | Sessões | `session_list` | `before?` para paginação de 30 sessões |
 | Sessões | `session_messages` | `session_id`, `after?`; até 30 mensagens |
@@ -44,12 +44,22 @@ A ponte Leptos encapsula essa chamada. O harness `aura-runtime` usa o mesmo disp
 | Operação | `action_confirm`, `action_cancel`, `action_retry` | `id`, `session_id` |
 | Operação | `action_reconcile` | `id` |
 | Áudio | `audio_devices`, `model_status`, `voice_list` | `{}` |
+| Áudio | `speech_prepare`, `speech_status` | `{}`; preparação em segundo plano e snapshot em cache |
+| Áudio | `alert_notice` | `kind`: `provider`, `models`, `capture` ou `synthesis` |
 | Áudio | `model_install` | `id` do catálogo; channel opcional de progresso |
 | Áudio | `voice_preview` | `id` da voz instalada |
 
 Selecionar modelo é salvar a configuração e aprová-la em `provider_probe`; não há uma segunda seleção silenciosa. Os commands antigos de sessões, memória e `model_validate` continuam como aliases diretos Tauri para compatibilidade. `model_validate` continua sendo somente validação de flags; o aplicativo real usa o probe.
 
 Campos de credencial ausentes ou `null` preservam o segredo. Uma string vazia fornecida explicitamente ao backend remove o valor; a UI trata seu campo vazio como preservação. O retorno de settings não inclui segredos.
+
+## Contratos de verificação do provedor, fala e ponte
+
+- **`provider_check`** (sem argumentos) retorna o probe armazenado quando ainda é válido para a configuração atual; caso contrário executa o probe completo e o publica. Chamadas concorrentes para a mesma revisão da configuração compartilham uma única operação, limitada a 60 s; ao expirar retorna `PROVIDER_TIMEOUT` (`retryable`). `provider_status` devolve o último probe publicado ou `null`.
+- **`speech_prepare`** inicia no máximo uma preparação em segundo plano dos modelos nativos selecionados (ASR, VAD e TTS, nessa ordem, seguidos da pré-carga real) e retorna imediatamente o snapshot. Estado pronto ou em andamento é devolvido sem novo trabalho; após falha, nova chamada tenta de novo. **`speech_status`** só lê o snapshot em cache (`phase`, `ready`, `active`, `artifact`, `file`, `downloaded`, `total`, `error`, `code`, `warning`, `generation`), sem hash, disco ou rede. Sem a feature `local-speech` o snapshot é `unsupported` (`SPEECH_UNSUPPORTED`).
+- **Instalação com origem local verificada:** cada arquivo do catálogo é reutilizado se a instalação existente ou a cópia em `AURA_MODEL_SOURCE_ROOT/<id>/<arquivo>` (padrão: `tools/audio-bench/data/models`, quando existe) confere em tamanho e SHA-256; só então ocorre o download HTTPS fixado. Arquivo local ausente ou inválido, portanto, pode iniciar download. A origem local é copiada, nunca movida.
+- **`alert_notice`** reproduz um dos quatro avisos WAV pt-BR embutidos no binário (sem TTS e sem modelos); o chamador só escolhe a variante, sem texto, caminho ou áudio. Um novo aviso cancela o anterior e a reprodução é serializada com a fala.
+- **Retenção do canal IPC (`public/bridge.js`):** cada `requestStream` reserva o canal por `id`; id em uso é recusado com `STREAM_IN_USE`. Em `conversation_start` o canal é retido até `run.completed`/`turn.cancelled`, falha ou descarte (`disposeStream`); eventos anteriores ao ticket são guardados e reproduzidos em ordem apenas se `session_id` e `generation` coincidirem com o ticket (inválido: `INVALID_TICKET`). Nos demais commands o canal é liberado quando a chamada termina.
 
 ## Eventos
 

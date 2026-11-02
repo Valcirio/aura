@@ -1,8 +1,13 @@
-use anyhow::{anyhow, bail, Result};
-use audio_bench::{emit, ensure_file, mean, ms, path_str, peak_rss_mb, rms, write_json, write_wav_i16};
+use anyhow::{Result, anyhow, bail};
+use audio_bench::{
+    emit, ensure_file, mean, ms, path_str, peak_rss_mb, rms, write_json, write_wav_i16,
+};
 use clap::Parser;
 use serde_json::json;
-use sherpa_onnx::{GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig, OfflineTtsModelConfig, OfflineTtsSupertonicModelConfig, OfflineTtsVitsModelConfig};
+use sherpa_onnx::{
+    GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig,
+    OfflineTtsModelConfig, OfflineTtsSupertonicModelConfig, OfflineTtsVitsModelConfig,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -38,6 +43,12 @@ struct Args {
     results_dir: PathBuf,
     #[arg(long, default_value_t = 1.0)]
     speed: f32,
+    /// Notice mode (requires --notice-output and --voice kokoro-dora): synthesizes this text only.
+    #[arg(long, requires = "notice_output")]
+    notice_text: Option<String>,
+    /// Notice mode: output path of the mono 24 kHz PCM16 WAV.
+    #[arg(long, requires = "notice_text")]
+    notice_output: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -58,7 +69,11 @@ struct Gen {
 
 fn remap_cps(v: &[i32]) -> Vec<i32> {
     let s: String = v.iter().filter_map(|&c| char::from_u32(c as u32)).collect();
-    s.replace("tʃ", "ʧ").replace("dʒ", "ʤ").chars().map(|c| c as i32).collect()
+    s.replace("tʃ", "ʧ")
+        .replace("dʒ", "ʤ")
+        .chars()
+        .map(|c| c as i32)
+        .collect()
 }
 
 /// Returns (samples, sample_rate, phonemize_ms, synth_ms).
@@ -68,7 +83,8 @@ fn synth(tts: &OfflineTts, g: &Gen, text: &str) -> Result<(Vec<f32>, i32, f64, f
         (None, text)
     } else {
         let lang = &g.lang;
-        let res = piper_phonemize::phonemize(text, lang).ok_or_else(|| anyhow!("phonemize failed for {text:?}"))?;
+        let res = piper_phonemize::phonemize(text, lang)
+            .ok_or_else(|| anyhow!("phonemize failed for {text:?}"))?;
         let mut cps: Vec<Vec<i32>> = Vec::new();
         for i in 0..res.num_sentences() {
             let v = res.get_phonemes(i).unwrap_or_default();
@@ -83,7 +99,12 @@ fn synth(tts: &OfflineTts, g: &Gen, text: &str) -> Result<(Vec<f32>, i32, f64, f
     let phonemize_ms = ms(t0.elapsed());
 
     let t1 = Instant::now();
-    let mut gen_cfg = GenerationConfig { sid: g.sid, speed: g.speed, phoneme_codepoints: cps, ..Default::default() };
+    let mut gen_cfg = GenerationConfig {
+        sid: g.sid,
+        speed: g.speed,
+        phoneme_codepoints: cps,
+        ..Default::default()
+    };
     if g.kind == Kind::Supertonic {
         gen_cfg.num_steps = g.num_steps;
         gen_cfg.extra = Some(HashMap::from([("lang".to_string(), json!("pt"))]));
@@ -92,11 +113,28 @@ fn synth(tts: &OfflineTts, g: &Gen, text: &str) -> Result<(Vec<f32>, i32, f64, f
         .generate_with_config(text_arg, &gen_cfg, None::<fn(&[f32], f32) -> bool>)
         .ok_or_else(|| anyhow!("generate_with_config failed"))?;
     let synth_ms = ms(t1.elapsed());
-    Ok((audio.samples().to_vec(), audio.sample_rate(), phonemize_ms, synth_ms))
+    Ok((
+        audio.samples().to_vec(),
+        audio.sample_rate(),
+        phonemize_ms,
+        synth_ms,
+    ))
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let notice = args.notice_text.is_some();
+    if notice {
+        if args.voice != "kokoro-dora" {
+            bail!("notice mode requires --voice kokoro-dora");
+        }
+        if args.no_remap {
+            bail!("notice mode does not allow --no-remap");
+        }
+        if args.sid.is_some_and(|s| s != 42) {
+            bail!("notice mode requires speaker 42 (pf_dora)");
+        }
+    }
     let kind = match args.voice.as_str() {
         "kokoro-dora" => Kind::Kokoro,
         "supertonic" => Kind::Supertonic,
@@ -108,10 +146,20 @@ fn main() -> Result<()> {
     });
     let tag = match kind {
         Kind::Piper => args.voice.clone(),
-        Kind::Kokoro => if args.no_remap { "kokoro-dora-noremap".to_string() } else { "kokoro-dora".to_string() },
+        Kind::Kokoro => {
+            if args.no_remap {
+                "kokoro-dora-noremap".to_string()
+            } else {
+                "kokoro-dora".to_string()
+            }
+        }
         Kind::Supertonic => format!("supertonic-sid{sid}"),
     };
-    let quality = if args.voice == "dii" { "high" } else { "medium" };
+    let quality = if args.voice == "dii" {
+        "high"
+    } else {
+        "medium"
+    };
     let vdir = args.models_dir.join(match kind {
         Kind::Piper => format!("piper-{}", args.voice),
         Kind::Kokoro => "kokoro-multi-lang-v1_0".to_string(),
@@ -191,7 +239,10 @@ fn main() -> Result<()> {
             model_name = "supertonic-3-int8".to_string();
         }
     }
-    let cfg = OfflineTtsConfig { model: model_cfg, ..Default::default() };
+    let cfg = OfflineTtsConfig {
+        model: model_cfg,
+        ..Default::default()
+    };
 
     let t0 = Instant::now();
     let tts = OfflineTts::create(&cfg).ok_or_else(|| anyhow!("OfflineTts::create failed"))?;
@@ -205,7 +256,10 @@ fn main() -> Result<()> {
         Kind::Kokoro => "pt-br".to_string(),
         Kind::Supertonic => String::new(),
     };
-    eprintln!("[tts-sherpa] voice={tag} load={load_ms:.0}ms sr={} lang={lang}", tts.sample_rate());
+    eprintln!(
+        "[tts-sherpa] voice={tag} load={load_ms:.0}ms sr={} lang={lang}",
+        tts.sample_rate()
+    );
 
     let g = Gen {
         kind,
@@ -218,6 +272,19 @@ fn main() -> Result<()> {
 
     // Warm-up (also triggers one-time espeak-ng-data extraction); excluded.
     let _ = synth(&tts, &g, "Olá.")?;
+
+    if let (Some(text), Some(output)) = (&args.notice_text, &args.notice_output) {
+        let (samples, sr, _, _) = synth(&tts, &g, text)?;
+        if sr != 24_000 {
+            bail!("unexpected sample rate {sr}, expected 24000");
+        }
+        if rms(&samples) < SILENT_RMS {
+            bail!("notice audio is silent for {text:?}");
+        }
+        write_wav_i16(output, &samples, sr as u32)?;
+        eprintln!("[tts-sherpa] notice wrote {}", output.display());
+        return Ok(());
+    }
 
     let mut rtfs = Vec::new();
     let mut rows = Vec::new();
@@ -248,8 +315,20 @@ fn main() -> Result<()> {
 
     let speaker = match kind {
         Kind::Piper => args.voice.clone(),
-        Kind::Kokoro => if sid == 42 { "pf_dora".to_string() } else { format!("sid{sid}") },
-        Kind::Supertonic => if sid < 5 { format!("F{}", sid + 1) } else { format!("M{}", sid - 4) },
+        Kind::Kokoro => {
+            if sid == 42 {
+                "pf_dora".to_string()
+            } else {
+                format!("sid{sid}")
+            }
+        }
+        Kind::Supertonic => {
+            if sid < 5 {
+                format!("F{}", sid + 1)
+            } else {
+                format!("M{}", sid - 4)
+            }
+        }
     };
     let license = match args.voice.as_str() {
         "dii" => "CC BY-NC (não comercial)",

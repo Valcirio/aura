@@ -6,23 +6,26 @@
 //!
 //! Layout: `<root>/<id>/<revision>/<files>` plus `<root>/<id>/current.json`.
 //!
-//! Concurrency note: simultaneous installers may race at revision publication
-//! (both stage, one renames first and the other verifies the winner's
-//! directory), but a pointer is only ever published after every file of the
-//! revision verified against the catalog. Installers delete only their own
-//! staging directory, never other `.partial-*` directories.
+//! Concurrency note: callers serialize installers per artifact. Should
+//! installers still race at revision publication (both stage, one renames
+//! first and the other verifies the winner's directory), a pointer is only ever
+//! published after every file of the revision verified against the catalog.
+//! Installers delete only their own staging/quarantine directories, never other
+//! `.partial-*` or `.corrupt-*` directories. Hashing, large copies, syncs and
+//! publication run on tracked blocking workers that cleanup cancels and joins.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 /// Per-file download ceiling (accommodates the 674,716,297-byte turbo encoder).
 pub const MAX_FILE_BYTES: u64 = 700_000_000;
@@ -45,6 +48,14 @@ pub struct CatalogFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Artifact {
     pub id: &'static str,
+    pub label: &'static str,
+    /// `asr`, `vad` or `tts`.
+    pub kind: &'static str,
+    pub description: &'static str,
+    /// Settings value selecting this model (ASR only).
+    pub asr_model: Option<&'static str>,
+    pub recommended: bool,
+    pub warning: Option<&'static str>,
     pub license: &'static str,
     pub revision: &'static str,
     pub files: &'static [CatalogFile],
@@ -148,6 +159,12 @@ static KOKORO_FILES: [CatalogFile; 4] = [
 static CATALOG: [Artifact; 4] = [
     Artifact {
         id: "whisper-turbo",
+        label: "Whisper Turbo",
+        kind: "asr",
+        description: "Reconhecimento de fala local, mais preciso. Recomendado.",
+        asr_model: Some("turbo"),
+        recommended: true,
+        warning: None,
         license: "MIT",
         revision: "2ca6ff69fc878651b770880507669577ac41c2ff",
         files: &WHISPER_TURBO_FILES,
@@ -158,6 +175,12 @@ static CATALOG: [Artifact; 4] = [
     },
     Artifact {
         id: "whisper-small",
+        label: "Whisper Small",
+        kind: "asr",
+        description: "Reconhecimento de fala local, mais leve e rápido.",
+        asr_model: Some("small"),
+        recommended: false,
+        warning: Some("Modelo mais leve; pode reduzir a precisão da transcrição."),
         license: "MIT",
         revision: "8f3c18b358db4d1f2fc1eae49d75cd20989e4309",
         files: &WHISPER_SMALL_FILES,
@@ -168,6 +191,12 @@ static CATALOG: [Artifact; 4] = [
     },
     Artifact {
         id: "silero-vad",
+        label: "Silero VAD",
+        kind: "vad",
+        description: "Detecção de atividade de voz para identificar quando você fala.",
+        asr_model: None,
+        recommended: false,
+        warning: None,
         license: "MIT",
         revision: "5cd2ba54db059f961e7545d4f211b44f005a6dfb",
         files: &SILERO_VAD_FILES,
@@ -178,6 +207,12 @@ static CATALOG: [Artifact; 4] = [
     },
     Artifact {
         id: "kokoro-multi-lang-v1_0",
+        label: "Kokoro (pt-BR)",
+        kind: "tts",
+        description: "Síntese de voz local multilíngue com a voz pt-BR Dora.",
+        asr_model: None,
+        recommended: false,
+        warning: None,
         license: "Apache-2.0",
         revision: "f7b96bb6bef5c5da4d3aa4f4e0498fbbf62dc78b",
         files: &KOKORO_FILES,
@@ -263,6 +298,13 @@ pub struct ArtifactStatus {
     pub id: String,
     pub installed: bool,
     pub license: String,
+    pub label: String,
+    pub kind: String,
+    pub description: String,
+    pub asr_model: Option<String>,
+    pub recommended: bool,
+    pub warning: Option<String>,
+    pub voice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,14 +389,6 @@ fn verify_file(path: &Path, file: &CatalogFile) -> Result<(), ModelError> {
     Ok(())
 }
 
-fn verify_revision(dir: &Path, artifact: &Artifact) -> Result<(), ModelError> {
-    require_real_dir(dir)?;
-    for file in artifact.files {
-        verify_file(&dir.join(file.name), file)?;
-    }
-    Ok(())
-}
-
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, ModelError>> + Send>>;
 
 #[async_trait::async_trait]
@@ -409,15 +443,120 @@ impl Source for HttpSource {
     }
 }
 
-/// Removes this invocation's staging directory and pointer temporary file.
+/// Installation progress. Superset of [`Progress`]: the `artifact`, `downloaded`
+/// and `total` keys keep their meaning (bytes of the current file).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    pub artifact: String,
+    /// `verifying`, `copying` or `downloading`.
+    pub phase: String,
+    pub file: Option<String>,
+    pub downloaded: u64,
+    pub total: u64,
+}
+
+/// Tracks blocking workers of one installation so cleanup can cancel them and
+/// wait until none can still write into the staging directory.
+struct Work {
+    cancelled: AtomicBool,
+    active: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl Work {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            active: Mutex::new(0),
+            idle: Condvar::new(),
+        })
+    }
+
+    fn check(&self) -> Result<(), ModelError> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            Err(ModelError::Io("instalação cancelada".to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Requests cancellation and blocks until every registered worker finished.
+    fn cancel_and_wait(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        while *active > 0 {
+            active = self.idle.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Registered before the worker is spawned and released when the worker
+/// finishes or is discarded without running.
+struct ActiveGuard(Arc<Work>);
+
+impl ActiveGuard {
+    fn enter(work: &Arc<Work>) -> Self {
+        *work.active.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Self(work.clone())
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        let mut active = self.0.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active -= 1;
+        if *active == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+/// Receives `(file, cumulative bytes of that file)` from blocking workers.
+type Tick<'a> = &'a dyn Fn(&'static str, u64);
+
+/// Runs `work_fn` on the blocking pool, forwarding its byte ticks to `on_tick`
+/// on the calling task. Dropping the future never leaves the worker untracked.
+async fn blocking<T: Send + 'static>(
+    work: &Arc<Work>,
+    work_fn: impl FnOnce(&Work, Tick<'_>) -> Result<T, ModelError> + Send + 'static,
+    mut on_tick: impl FnMut(&'static str, u64),
+) -> Result<T, ModelError> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(&'static str, u64)>();
+    let guard = ActiveGuard::enter(work);
+    let mut handle = tokio::task::spawn_blocking(move || {
+        let guard = guard;
+        work_fn(&guard.0, &|file, bytes| {
+            let _ = tx.send((file, bytes));
+        })
+    });
+    loop {
+        tokio::select! {
+            result = &mut handle => {
+                while let Ok((file, bytes)) = rx.try_recv() {
+                    on_tick(file, bytes);
+                }
+                return result
+                    .map_err(|_| ModelError::Io("tarefa de instalação interrompida".to_string()))?;
+            }
+            Some((file, bytes)) = rx.recv() => on_tick(file, bytes),
+        }
+    }
+}
+
+/// Cancels and joins this invocation's blocking workers, then removes its
+/// staging directory, quarantine directory and pointer temporary file.
 struct Cleanup {
+    work: Arc<Work>,
     staging: PathBuf,
     pointer_tmp: PathBuf,
+    quarantine: PathBuf,
 }
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        self.work.cancel_and_wait();
         let _ = std::fs::remove_dir_all(&self.staging);
+        let _ = std::fs::remove_dir_all(&self.quarantine);
         let _ = std::fs::remove_file(&self.pointer_tmp);
     }
 }
@@ -428,20 +567,81 @@ pub async fn install(
     id: &str,
     progress: impl Fn(Progress) + Send + Sync,
 ) -> Result<InstallManifest, ModelError> {
+    install_managed(root, None, id, |report| {
+        progress(Progress {
+            artifact: report.artifact,
+            downloaded: report.downloaded,
+            total: report.total,
+        })
+    })
+    .await
+}
+
+/// Like [`install`], but reuses verified installed content and, per file,
+/// verified copies under `<local_root>/<id>/<name>` before touching the network.
+/// Callers serialize invocations per artifact; dropping the future cancels the
+/// installation and removes its staging.
+pub async fn install_managed(
+    root: &Path,
+    local_root: Option<&Path>,
+    id: &str,
+    progress: impl Fn(Report) + Send + Sync,
+) -> Result<InstallManifest, ModelError> {
     // Unknown ids are rejected before any filesystem or network activity.
     if lookup(id).is_none() {
         return Err(ModelError::UnknownId(id.to_string()));
     }
     let source = HttpSource::new()?;
-    install_with(root, &CATALOG, &source, id, &progress).await
+    install_with(root, local_root, &CATALOG, &source, id, &progress).await
+}
+
+/// Test-only transport that refuses every fetch and records the attempt.
+#[cfg(test)]
+pub(crate) struct NoNetworkSource {
+    pub attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Source for NoNetworkSource {
+    async fn open(&self, _url: &str) -> Result<ByteStream, ModelError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(ModelError::Network("rede bloqueada no teste".into()))
+    }
+}
+
+/// Test-only [`install_managed`] over the real catalog that can only use verified
+/// installed/local content; any fetch attempt is counted in `attempts` and fails.
+#[cfg(test)]
+pub(crate) async fn install_local_only(
+    root: &Path,
+    local_root: &Path,
+    id: &str,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+    progress: impl Fn(Report) + Send + Sync,
+) -> Result<InstallManifest, ModelError> {
+    if lookup(id).is_none() {
+        return Err(ModelError::UnknownId(id.to_string()));
+    }
+    let source = NoNetworkSource { attempts };
+    install_with(root, Some(local_root), &CATALOG, &source, id, &progress).await
+}
+
+fn file_size(artifact: &Artifact, name: &str) -> u64 {
+    artifact
+        .files
+        .iter()
+        .find(|file| file.name == name)
+        .map_or(0, |file| file.size)
 }
 
 async fn install_with(
     root: &Path,
-    catalog: &[Artifact],
+    local_root: Option<&Path>,
+    catalog: &'static [Artifact],
     source: &dyn Source,
     id: &str,
-    progress: &(dyn Fn(Progress) + Send + Sync),
+    progress: &(dyn Fn(Report) + Send + Sync),
 ) -> Result<InstallManifest, ModelError> {
     let artifact = catalog
         .iter()
@@ -465,71 +665,352 @@ async fn install_with(
     }
     require_real_dir(&artifact_dir)?;
 
+    let report = |phase: &str, file: &str, downloaded: u64| {
+        progress(Report {
+            artifact: artifact.id.to_string(),
+            phase: phase.to_string(),
+            file: Some(file.to_string()),
+            downloaded,
+            total: file_size(artifact, file),
+        })
+    };
+
+    let work = Work::new();
     let token = uuid::Uuid::new_v4();
     let staging = artifact_dir.join(format!(".partial-{token}"));
     let pointer_tmp = artifact_dir.join(format!(".current-{token}.tmp"));
+    let quarantine = artifact_dir.join(format!(".corrupt-{token}"));
     let _cleanup = Cleanup {
+        work: work.clone(),
         staging: staging.clone(),
         pointer_tmp: pointer_tmp.clone(),
+        quarantine: quarantine.clone(),
     };
-    std::fs::create_dir(&staging)?;
-
-    for file in artifact.files {
-        let path = staging.join(file.name);
-        let mut stream = source.open(file.url).await?;
-        let mut out = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await?;
-        let mut hasher = Sha256::new();
-        let mut total = 0u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            total += chunk.len() as u64;
-            if total > file.size || total > MAX_FILE_BYTES {
-                return Err(ModelError::TooLarge(file.name.to_string()));
-            }
-            hasher.update(&chunk);
-            out.write_all(&chunk).await?;
-            progress(Progress {
-                artifact: artifact.id.to_string(),
-                downloaded: total,
-                total: file.size,
-            });
-        }
-        out.flush().await?;
-        out.sync_all().await?;
-        drop(out);
-        if total != file.size {
-            return Err(ModelError::Integrity(format!("tamanho de {}", file.name)));
-        }
-        if hex(&hasher.finalize()) != file.sha256 {
-            return Err(ModelError::Integrity(format!("hash de {}", file.name)));
-        }
-    }
-
     let manifest = manifest_for(artifact);
     let encoded =
         serde_json::to_vec(&manifest).map_err(|error| ModelError::Io(error.to_string()))?;
-    write_synced(&staging.join("manifest.json"), &encoded)?;
-
     let target = artifact_dir.join(artifact.revision);
+    let pointer = artifact_dir.join("current.json");
+
+    // An installed revision is verified first: valid ones only get their pointer
+    // repaired, corrupt ones are removed before a verified replacement is staged.
     if target.exists() || is_symlink(&target)? {
+        let valid = {
+            let target = target.clone();
+            blocking(
+                &work,
+                move |work, tick| inspect_revision(&target, artifact, work, tick),
+                |file, bytes| report("verifying", file, bytes),
+            )
+            .await?
+        };
+        if valid {
+            let (tmp, current, bytes) = (pointer_tmp.clone(), pointer.clone(), encoded.clone());
+            blocking(
+                &work,
+                move |work, _| {
+                    work.check()?;
+                    write_pointer(&tmp, &current, &bytes)
+                },
+                |_, _| {},
+            )
+            .await?;
+            return Ok(manifest);
+        }
+        let (current, revision, trash) = (pointer.clone(), target.clone(), quarantine.clone());
+        blocking(
+            &work,
+            move |work, _| {
+                work.check()?;
+                match std::fs::remove_file(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                std::fs::rename(&revision, &trash)?;
+                std::fs::remove_dir_all(&trash)?;
+                Ok(())
+            },
+            |_, _| {},
+        )
+        .await?;
+    }
+
+    std::fs::create_dir(&staging)?;
+    for file in artifact.files {
+        let destination = staging.join(file.name);
+        if let Some(local_root) = local_root {
+            let candidate = local_root.join(artifact.id).join(file.name);
+            let destination = destination.clone();
+            let copied = blocking(
+                &work,
+                move |work, tick| copy_verified(&candidate, &destination, file, work, tick),
+                |name, bytes| report("copying", name, bytes),
+            )
+            .await?;
+            if copied {
+                continue;
+            }
+        }
+        download_file(source, file, &destination, &work, |bytes| {
+            report("downloading", file.name, bytes)
+        })
+        .await?;
+    }
+
+    let (staging_dir, revision, dir, tmp, bytes) = (
+        staging.clone(),
+        target.clone(),
+        artifact_dir.clone(),
+        pointer_tmp.clone(),
+        encoded,
+    );
+    blocking(
+        &work,
+        move |work, tick| {
+            publish(
+                &staging_dir,
+                &revision,
+                &dir,
+                artifact,
+                &tmp,
+                &bytes,
+                work,
+                tick,
+            )
+        },
+        |_, _| {},
+    )
+    .await?;
+    Ok(manifest)
+}
+
+/// Streams one pinned file into `destination`. Hashing, writes and sync run on
+/// tracked blocking workers in batches.
+async fn download_file(
+    source: &dyn Source,
+    file: &'static CatalogFile,
+    destination: &Path,
+    work: &Arc<Work>,
+    progress: impl Fn(u64),
+) -> Result<(), ModelError> {
+    const BATCH: usize = 1024 * 1024;
+    let mut stream = source.open(file.url).await?;
+    let out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut state = (out, Sha256::new());
+    let mut pending: Vec<u8> = Vec::new();
+    let mut total = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        total += chunk.len() as u64;
+        if total > file.size || total > MAX_FILE_BYTES {
+            return Err(ModelError::TooLarge(file.name.to_string()));
+        }
+        pending.extend_from_slice(&chunk);
+        progress(total);
+        if pending.len() >= BATCH {
+            state = write_batch(work, state, std::mem::take(&mut pending)).await?;
+        }
+    }
+    state = write_batch(work, state, std::mem::take(&mut pending)).await?;
+    let digest = blocking(
+        work,
+        move |work, _| {
+            work.check()?;
+            let (mut out, hasher) = state;
+            std::io::Write::flush(&mut out)?;
+            out.sync_all()?;
+            Ok(hex(&hasher.finalize()))
+        },
+        |_, _| {},
+    )
+    .await?;
+    if total != file.size {
+        return Err(ModelError::Integrity(format!("tamanho de {}", file.name)));
+    }
+    if digest != file.sha256 {
+        return Err(ModelError::Integrity(format!("hash de {}", file.name)));
+    }
+    Ok(())
+}
+
+async fn write_batch(
+    work: &Arc<Work>,
+    state: (std::fs::File, Sha256),
+    batch: Vec<u8>,
+) -> Result<(std::fs::File, Sha256), ModelError> {
+    if batch.is_empty() {
+        return Ok(state);
+    }
+    blocking(
+        work,
+        move |work, _| {
+            work.check()?;
+            let (mut out, mut hasher) = state;
+            hasher.update(&batch);
+            std::io::Write::write_all(&mut out, &batch)?;
+            Ok((out, hasher))
+        },
+        |_, _| {},
+    )
+    .await
+}
+
+/// Hashes a regular, non-symlink file. `Ok(false)` when it is absent, not a
+/// regular file, or differs from the pinned size/hash.
+fn hash_matches(
+    path: &Path,
+    file: &CatalogFile,
+    work: &Work,
+    tick: Tick<'_>,
+) -> Result<bool, ModelError> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() != file.size {
+        return Ok(false);
+    }
+    let mut source = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        work.check()?;
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > file.size {
+            return Ok(false);
+        }
+        hasher.update(&buffer[..read]);
+        tick(file.name, total);
+    }
+    Ok(total == file.size && hex(&hasher.finalize()) == file.sha256)
+}
+
+/// `Ok(true)` when the revision directory and every catalog file verify;
+/// `Ok(false)` when content is missing or corrupt; `Err` for a symlinked or
+/// non-directory revision, which is rejected rather than touched.
+fn inspect_revision(
+    dir: &Path,
+    artifact: &Artifact,
+    work: &Work,
+    tick: Tick<'_>,
+) -> Result<bool, ModelError> {
+    require_real_dir(dir)?;
+    for file in artifact.files {
+        if !hash_matches(&dir.join(file.name), file, work, tick)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Copies a local file into staging while hashing. Any problem with the source
+/// discards the staged file and yields `Ok(false)` (fall back to the network);
+/// failures writing staging are errors.
+fn copy_verified(
+    source: &Path,
+    destination: &Path,
+    file: &CatalogFile,
+    work: &Work,
+    tick: Tick<'_>,
+) -> Result<bool, ModelError> {
+    match std::fs::symlink_metadata(source) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() && meta.len() == file.size => {
+        }
+        _ => return Ok(false),
+    }
+    let Ok(mut input) = std::fs::File::open(source) else {
+        return Ok(false);
+    };
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let result = (|| -> Result<bool, ModelError> {
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            work.check()?;
+            let read = match input.read(&mut buffer) {
+                Ok(read) => read,
+                Err(_) => return Ok(false),
+            };
+            if read == 0 {
+                break;
+            }
+            total += read as u64;
+            if total > file.size {
+                return Ok(false);
+            }
+            hasher.update(&buffer[..read]);
+            std::io::Write::write_all(&mut out, &buffer[..read])?;
+            tick(file.name, total);
+        }
+        if total != file.size || hex(&hasher.finalize()) != file.sha256 {
+            return Ok(false);
+        }
+        std::io::Write::flush(&mut out)?;
+        out.sync_all()?;
+        Ok(true)
+    })();
+    if !matches!(result, Ok(true)) {
+        drop(out);
+        let _ = std::fs::remove_file(destination);
+    }
+    result
+}
+
+/// Writes the manifest, publishes the staged revision (or accepts an
+/// identical verified one that appeared meanwhile) and then the pointer.
+#[allow(clippy::too_many_arguments)]
+fn publish(
+    staging: &Path,
+    target: &Path,
+    artifact_dir: &Path,
+    artifact: &Artifact,
+    pointer_tmp: &Path,
+    manifest: &[u8],
+    work: &Work,
+    tick: Tick<'_>,
+) -> Result<(), ModelError> {
+    work.check()?;
+    write_synced(&staging.join("manifest.json"), manifest)?;
+    let ensure_valid = || -> Result<(), ModelError> {
+        if inspect_revision(target, artifact, work, tick)? {
+            Ok(())
+        } else {
+            Err(ModelError::Integrity(format!("revisão de {}", artifact.id)))
+        }
+    };
+    if target.exists() || is_symlink(target)? {
         // Same revision already present: never overwrite, verify before reuse.
-        verify_revision(&target, artifact)?;
-    } else if let Err(error) = std::fs::rename(&staging, &target) {
+        ensure_valid()?;
+    } else if let Err(error) = std::fs::rename(staging, target) {
         // Another installer may have published first; reuse only if it verifies.
         if target.exists() {
-            verify_revision(&target, artifact)?;
+            ensure_valid()?;
         } else {
             return Err(error.into());
         }
     }
+    work.check()?;
+    write_pointer(pointer_tmp, &artifact_dir.join("current.json"), manifest)
+}
 
-    write_synced(&pointer_tmp, &encoded)?;
-    std::fs::rename(&pointer_tmp, artifact_dir.join("current.json"))?;
-    Ok(manifest)
+fn write_pointer(tmp: &Path, current: &Path, manifest: &[u8]) -> Result<(), ModelError> {
+    write_synced(tmp, manifest)?;
+    std::fs::rename(tmp, current)?;
+    Ok(())
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), ModelError> {
@@ -562,6 +1043,13 @@ fn status_in(root: &Path, catalog: &[Artifact]) -> Status {
                 id: artifact.id.to_string(),
                 installed,
                 license: artifact.license.to_string(),
+                label: artifact.label.to_string(),
+                kind: artifact.kind.to_string(),
+                description: artifact.description.to_string(),
+                asr_model: artifact.asr_model.map(str::to_string),
+                recommended: artifact.recommended,
+                warning: artifact.warning.map(str::to_string),
+                voice: artifact.voice.map(str::to_string),
             }
         })
         .collect();
@@ -688,6 +1176,12 @@ mod tests {
         let files: &'static [CatalogFile] = Box::leak(files.into_boxed_slice());
         Box::leak(Box::new([Artifact {
             id: "fixture",
+            label: "Fixture",
+            kind: "asr",
+            description: "Fixture",
+            asr_model: None,
+            recommended: false,
+            warning: None,
             license: "MIT",
             revision: "rev1",
             files,
@@ -696,6 +1190,43 @@ mod tests {
             speaker: None,
             phonemizer: None,
         }]))
+    }
+
+    #[test]
+    fn status_exposes_catalog_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = status_in(dir.path(), catalog());
+        let ids: Vec<&str> = status.artifacts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "whisper-turbo",
+                "whisper-small",
+                "silero-vad",
+                "kokoro-multi-lang-v1_0"
+            ]
+        );
+        assert!(status.packages.is_empty());
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["packages"], serde_json::json!({}));
+        let a = &json["artifacts"];
+        assert_eq!(a[0]["asr_model"], "turbo");
+        assert_eq!(a[0]["recommended"], true);
+        assert_eq!(a[0]["kind"], "asr");
+        assert_eq!(a[1]["asr_model"], "small");
+        assert_eq!(
+            a[1]["warning"],
+            "Modelo mais leve; pode reduzir a precisão da transcrição."
+        );
+        assert_eq!(a[2]["kind"], "vad");
+        assert_eq!(a[3]["kind"], "tts");
+        assert_eq!(a[3]["voice"], "pf_dora");
+        for item in a.as_array().unwrap() {
+            assert_eq!(item["installed"], false);
+            assert!(item["license"].is_string());
+            assert!(item["label"].as_str().unwrap().len() > 0);
+            assert!(item["description"].as_str().unwrap().len() > 0);
+        }
     }
 
     fn good_source() -> FixtureSource {
@@ -707,7 +1238,7 @@ mod tests {
         source: &FixtureSource,
         id: &str,
     ) -> Result<InstallManifest, ModelError> {
-        install_with(root, fixture_catalog(), source, id, &|_| {}).await
+        install_with(root, None, fixture_catalog(), source, id, &|_| {}).await
     }
 
     fn partials(root: &Path) -> Vec<String> {
@@ -715,7 +1246,11 @@ mod tests {
             .map(|dir| {
                 dir.flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with(".partial-") || n.starts_with(".current-"))
+                    .filter(|n| {
+                        n.starts_with(".partial-")
+                            || n.starts_with(".current-")
+                            || n.starts_with(".corrupt-")
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -747,6 +1282,7 @@ mod tests {
         let events = Mutex::new(Vec::new());
         install_with(
             dir.path(),
+            None,
             fixture_catalog(),
             &good_source(),
             "fixture",
@@ -761,12 +1297,14 @@ mod tests {
             .last()
             .unwrap();
         assert_eq!(last_a.downloaded, A.len() as u64);
+        assert_eq!(last_a.file.as_deref(), Some("a.bin"));
         assert_eq!(events.last().unwrap().downloaded, B.len() as u64);
         assert!(events.iter().all(|e| e.artifact == "fixture"));
+        assert!(events.iter().all(|e| e.phase == "downloading"));
         let json = serde_json::to_value(&events[0]).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["artifact", "downloaded", "total"]);
+        assert_eq!(keys, ["artifact", "downloaded", "file", "phase", "total"]);
     }
 
     #[tokio::test]
@@ -829,29 +1367,13 @@ mod tests {
         let _ = files;
         let failing = FixtureSource::new(&[("a.bin", A)]);
         assert!(
-            install_with(dir.path(), other, &failing, "fixture", &|_| {})
+            install_with(dir.path(), None, other, &failing, "fixture", &|_| {})
                 .await
                 .is_err()
         );
         assert_eq!(std::fs::read(&pointer).unwrap(), before);
         assert!(partials(dir.path()).is_empty());
         assert!(!dir.path().join("fixture/rev2").exists());
-    }
-
-    #[tokio::test]
-    async fn corrupt_existing_revision_not_overwritten() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = good_source();
-        run(dir.path(), &source, "fixture").await.unwrap();
-        let pointer = dir.path().join("fixture/current.json");
-        let before = std::fs::read(&pointer).unwrap();
-        let file = dir.path().join("fixture/rev1/a.bin");
-        std::fs::write(&file, b"alpha-bytez").unwrap();
-        assert!(run(dir.path(), &source, "fixture").await.is_err());
-        assert_eq!(std::fs::read(&file).unwrap(), b"alpha-bytez");
-        assert_eq!(std::fs::read(&pointer).unwrap(), before);
-        assert!(partials(dir.path()).is_empty());
-        assert!(artifact_path_in(dir.path(), fixture_catalog(), "fixture", "a.bin").is_err());
     }
 
     #[tokio::test]
@@ -937,10 +1459,10 @@ mod tests {
         assert!(before.artifacts.iter().all(|a| !a.installed));
         let json = serde_json::to_value(&before).unwrap();
         assert_eq!(json["packages"], serde_json::json!({}));
-        assert_eq!(
-            json["artifacts"][0],
-            serde_json::json!({"id": "whisper-turbo", "installed": false, "license": "MIT"})
-        );
+        let first = &json["artifacts"][0];
+        assert_eq!(first["id"], "whisper-turbo");
+        assert_eq!(first["installed"], false);
+        assert_eq!(first["license"], "MIT");
         run(dir.path(), &good_source(), "fixture").await.unwrap();
         let after = status_in(dir.path(), fixture_catalog());
         assert!(after.artifacts[0].installed);
@@ -1083,5 +1605,218 @@ mod tests {
         assert_eq!(lookup("whisper-turbo").unwrap().threads, Some(8));
         assert_eq!(lookup("whisper-small").unwrap().threads, Some(4));
         assert_eq!(lookup("silero-vad").unwrap().license, "MIT");
+    }
+
+    struct HangSource;
+
+    #[async_trait::async_trait]
+    impl Source for HangSource {
+        async fn open(&self, _url: &str) -> Result<ByteStream, ModelError> {
+            let first = futures_util::stream::iter(vec![Ok(b"alp".to_vec())]);
+            let hang = futures_util::stream::pending::<Result<Vec<u8>, ModelError>>();
+            Ok(Box::pin(first.chain(hang)))
+        }
+    }
+
+    fn write_local(local: &Path, a: &[u8], b: &[u8]) {
+        std::fs::create_dir_all(local.join("fixture")).unwrap();
+        std::fs::write(local.join("fixture/a.bin"), a).unwrap();
+        std::fs::write(local.join("fixture/b.txt"), b).unwrap();
+    }
+
+    async fn run_local(
+        root: &Path,
+        local: &Path,
+        source: &dyn Source,
+        events: &Mutex<Vec<Report>>,
+    ) -> Result<InstallManifest, ModelError> {
+        install_with(
+            root,
+            Some(local),
+            fixture_catalog(),
+            source,
+            "fixture",
+            &|p| events.lock().unwrap().push(p),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn verified_local_files_avoid_the_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        write_local(local.path(), A, B);
+        let source = FixtureSource::new(&[]);
+        let events = Mutex::new(Vec::new());
+        run_local(dir.path(), local.path(), &source, &events)
+            .await
+            .unwrap();
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
+        let path = artifact_path_in(dir.path(), fixture_catalog(), "fixture", "b.txt").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), B);
+        assert!(partials(dir.path()).is_empty());
+        let events = events.into_inner().unwrap();
+        assert!(!events.is_empty() && events.iter().all(|e| e.phase == "copying"));
+        // The local files are copied, never moved or linked.
+        assert!(local.path().join("fixture/a.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_missing_local_files_fall_back_to_pinned_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        // Same size, different bytes; the second file is absent.
+        write_local(local.path(), b"alpha-bytez", B);
+        std::fs::remove_file(local.path().join("fixture/b.txt")).unwrap();
+        let source = good_source();
+        let events = Mutex::new(Vec::new());
+        run_local(dir.path(), local.path(), &source, &events)
+            .await
+            .unwrap();
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
+        let path = artifact_path_in(dir.path(), fixture_catalog(), "fixture", "a.bin").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), A);
+        assert!(partials(dir.path()).is_empty());
+
+        // A truncated local file is also rejected; the intact one is reused.
+        let dir = tempfile::tempdir().unwrap();
+        write_local(local.path(), b"alpha", B);
+        let source = good_source();
+        run_local(dir.path(), local.path(), &source, &events)
+            .await
+            .unwrap();
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_local_file_never_published_when_network_also_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        write_local(local.path(), b"alpha-bytez", B);
+        let source = FixtureSource::new(&[]);
+        let events = Mutex::new(Vec::new());
+        assert!(
+            run_local(dir.path(), local.path(), &source, &events)
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join("fixture/current.json").exists());
+        assert!(!dir.path().join("fixture/rev1").exists());
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn verified_installed_revision_is_reused_and_pointer_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), &good_source(), "fixture").await.unwrap();
+        std::fs::remove_file(dir.path().join("fixture/current.json")).unwrap();
+        assert!(artifact_path_in(dir.path(), fixture_catalog(), "fixture", "a.bin").is_err());
+        let offline = FixtureSource::new(&[]);
+        run(dir.path(), &offline, "fixture").await.unwrap();
+        assert_eq!(offline.fetches.load(Ordering::SeqCst), 0);
+        assert!(artifact_path_in(dir.path(), fixture_catalog(), "fixture", "a.bin").is_ok());
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_installed_revision_is_replaced_with_verified_content() {
+        for damage in ["corrupt", "missing"] {
+            let dir = tempfile::tempdir().unwrap();
+            run(dir.path(), &good_source(), "fixture").await.unwrap();
+            let file = dir.path().join("fixture/rev1/a.bin");
+            if damage == "corrupt" {
+                std::fs::write(&file, b"alpha-bytez").unwrap();
+            } else {
+                std::fs::remove_file(&file).unwrap();
+            }
+            assert!(artifact_path_in(dir.path(), fixture_catalog(), "fixture", "a.bin").is_err());
+            let source = good_source();
+            run(dir.path(), &source, "fixture").await.unwrap();
+            assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
+            let path = artifact_path_in(dir.path(), fixture_catalog(), "fixture", "a.bin").unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), A);
+            assert!(partials(dir.path()).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_installed_revision_with_failing_network_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), &good_source(), "fixture").await.unwrap();
+        std::fs::write(dir.path().join("fixture/rev1/a.bin"), b"alpha-bytez").unwrap();
+        assert!(
+            run(dir.path(), &FixtureSource::new(&[]), "fixture")
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join("fixture/current.json").exists());
+        assert!(!dir.path().join("fixture/rev1").exists());
+        assert!(partials(dir.path()).is_empty());
+        // A later retry succeeds.
+        run(dir.path(), &good_source(), "fixture").await.unwrap();
+        assert!(artifact_path_in(dir.path(), fixture_catalog(), "fixture", "a.bin").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_revision_is_rejected_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("a.bin"), A).unwrap();
+        std::fs::create_dir_all(dir.path().join("fixture")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("fixture/rev1")).unwrap();
+        assert!(matches!(
+            run(dir.path(), &good_source(), "fixture")
+                .await
+                .unwrap_err(),
+            ModelError::InvalidPath(_)
+        ));
+        assert!(outside.path().join("a.bin").exists());
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_install_leaves_no_staging_or_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let future = install_with(
+            dir.path(),
+            None,
+            fixture_catalog(),
+            &HangSource,
+            "fixture",
+            &|_| {},
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), future)
+                .await
+                .is_err()
+        );
+        assert!(partials(dir.path()).is_empty());
+        assert!(!dir.path().join("fixture/current.json").exists());
+        assert!(!dir.path().join("fixture/rev1").exists());
+        // Retry after cancellation works.
+        run(dir.path(), &good_source(), "fixture").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_cancels_and_joins_blocking_workers() {
+        let work = Work::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let future = blocking(
+            &work,
+            move |work, _| {
+                while work.check().is_ok() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            |_, _| {},
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(20), future).await;
+        work.cancel_and_wait();
+        assert!(finished.load(Ordering::SeqCst));
     }
 }

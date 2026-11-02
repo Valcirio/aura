@@ -20,8 +20,13 @@ async fn app_stream(
     runtime: State<'_, Arc<Runtime>>,
 ) -> Result<Value> {
     let sink: EventSink = Arc::new(move |event: support_runtime::runtime::AppEvent| {
-        if let Ok(value) = serde_json::to_value(event) {
-            let _ = on_event.send(value);
+        match serde_json::to_value(event) {
+            Ok(value) => {
+                if on_event.send(value).is_err() {
+                    eprintln!("stream channel send failed");
+                }
+            }
+            Err(_) => eprintln!("stream event serialization failed"),
         }
     });
     support_runtime::commands::dispatch(runtime.inner().clone(), &command, args, Some(sink)).await

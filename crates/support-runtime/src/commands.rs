@@ -3,7 +3,7 @@ use crate::{
     AppError, Result, Runtime,
     config::Settings,
     google::database,
-    runtime::{AppEvent, EventSink},
+    runtime::{AppEvent, EventSink, NoticeKind},
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -107,6 +107,12 @@ struct Prepare {
     event: support_core::calendar::EventInput,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Notice {
+    kind: NoticeKind,
+}
+
 pub async fn dispatch(
     runtime: Arc<Runtime>,
     command: &str,
@@ -150,6 +156,10 @@ pub async fn dispatch(
         "provider_probe" => {
             let _: Empty = decode(args)?;
             encode(runtime.provider_probe().await?)
+        }
+        "provider_check" => {
+            let _: Empty = decode(args)?;
+            encode(runtime.provider_check().await?)
         }
         "provider_status" => {
             let _: Empty = decode(args)?;
@@ -320,6 +330,19 @@ pub async fn dispatch(
             let _: Empty = decode(args)?;
             runtime.model_status().await
         }
+        "speech_prepare" => {
+            let _: Empty = decode(args)?;
+            runtime.speech_prepare().await
+        }
+        "speech_status" => {
+            let _: Empty = decode(args)?;
+            runtime.speech_status()
+        }
+        "alert_notice" => {
+            let v: Notice = decode(args)?;
+            runtime.alert_notice(v.kind).await?;
+            Ok(json!({"played":true}))
+        }
         "voice_preview" => {
             let v: Id = decode(args)?;
             runtime.preview(v.id).await?;
@@ -392,5 +415,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(messages.as_array().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn provider_check_command_takes_no_arguments_and_reports_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::new(
+            directory.path().into(),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        );
+        let runtime = Runtime::open(paths).unwrap();
+        assert!(
+            dispatch(
+                runtime.clone(),
+                "provider_check",
+                json!({"extra":true}),
+                None
+            )
+            .await
+            .is_err()
+        );
+        let mut settings = Settings::default();
+        settings.provider.kind = crate::config::ProviderKind::CompatibleApi;
+        settings.provider.base_url = "http://127.0.0.1:9/v1".into();
+        runtime
+            .save_settings(settings, None, None, None)
+            .await
+            .unwrap();
+        // Closed local port: a prompt, actionable failure, never a panic or hang.
+        let error = dispatch(runtime, "provider_check", json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(!error.message.is_empty());
+    }
+    #[tokio::test]
+    async fn speech_commands_take_no_arguments_and_return_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let fake = Arc::new(crate::runtime::speech_fixture::FakeSpeech::default());
+        let runtime = crate::runtime::speech_fixture::runtime_with(directory.path(), &fake);
+        for command in ["speech_status", "speech_prepare"] {
+            assert!(
+                dispatch(runtime.clone(), command, json!({"extra":true}), None)
+                    .await
+                    .is_err()
+            );
+        }
+        let idle = dispatch(runtime.clone(), "speech_status", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(idle["phase"], "idle");
+        assert!(fake.installed().is_empty());
+        let started = dispatch(runtime.clone(), "speech_prepare", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(started["active"], true);
+        for _ in 0..400 {
+            let status = dispatch(runtime.clone(), "speech_status", json!({}), None)
+                .await
+                .unwrap();
+            if status["ready"] == true {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("speech never became ready");
+    }
+    #[tokio::test]
+    async fn alert_notice_accepts_only_a_known_kind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let fake = Arc::new(crate::runtime::speech_fixture::FakeSpeech::default());
+        let mut runtime = crate::runtime::speech_fixture::runtime_with(directory.path(), &fake);
+        let plays = Arc::new(AtomicUsize::new(0));
+        let counter = plays.clone();
+        Arc::get_mut(&mut runtime).unwrap().playback = Arc::new(
+            crate::runtime::Playback::with_player(Arc::new(move |pcm, _, _, _| {
+                assert_eq!(pcm.sample_rate, 24000);
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })),
+        );
+        for args in [
+            json!({}),
+            json!({"kind":"unknown"}),
+            json!({"kind":"provider","text":"x"}),
+            json!({"kind":"provider","path":"/etc/passwd"}),
+            json!({"kind":"provider","pcm":[0.0]}),
+            json!({"kind":"../provider"}),
+            json!({"kind":null}),
+            json!("provider"),
+        ] {
+            assert!(
+                dispatch(runtime.clone(), "alert_notice", args, None)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(plays.load(Ordering::SeqCst), 0);
+        for kind in ["provider", "models", "capture", "synthesis"] {
+            let played = dispatch(runtime.clone(), "alert_notice", json!({"kind":kind}), None)
+                .await
+                .unwrap();
+            assert_eq!(played["played"], true);
+        }
+        assert_eq!(plays.load(Ordering::SeqCst), 4);
     }
 }

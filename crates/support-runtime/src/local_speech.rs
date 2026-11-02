@@ -218,6 +218,92 @@ impl LocalSpeech {
         path_string(&models::artifact_path(&self.paths.models(), id, file).map_err(model_error)?)
     }
 
+    fn ensure_vad(&self, vad: &mut VadModel, captured: u64) -> Result<()> {
+        self.check(captured)?;
+        if vad.session.is_none() {
+            let path = self.artifact(VAD_ID, "silero_vad.onnx")?;
+            let session = Session::builder()
+                .and_then(|b| b.with_intra_threads(1))
+                .and_then(|b| b.with_inter_threads(1))
+                .and_then(|b| b.commit_from_file(path))
+                .map_err(|e| audio_error(format!("Falha ao carregar VAD: {e}")))?;
+            self.check(captured)?;
+            vad.session = Some(session);
+        }
+        Ok(())
+    }
+    fn ensure_asr(&self, guard: &mut Option<OfflineRecognizer>, captured: u64) -> Result<()> {
+        self.check(captured)?;
+        if guard.is_none() {
+            let (id, prefix) = (self.asr_model.id(), self.asr_model.prefix());
+            let encoder = self.artifact(id, &format!("{prefix}-encoder.int8.onnx"))?;
+            let decoder = self.artifact(id, &format!("{prefix}-decoder.int8.onnx"))?;
+            let tokens = self.artifact(id, &format!("{prefix}-tokens.txt"))?;
+            let mut cfg = OfflineRecognizerConfig::default();
+            cfg.model_config.whisper = OfflineWhisperModelConfig {
+                encoder: Some(encoder),
+                decoder: Some(decoder),
+                language: Some("pt".into()),
+                task: Some("transcribe".into()),
+                tail_paddings: 0,
+                enable_token_timestamps: false,
+                enable_segment_timestamps: false,
+            };
+            cfg.model_config.tokens = Some(tokens);
+            cfg.model_config.provider = Some("cpu".into());
+            cfg.model_config.debug = false;
+            cfg.model_config.num_threads = self.asr_model.threads();
+            let recognizer = OfflineRecognizer::create(&cfg)
+                .ok_or_else(|| audio_error("Falha ao carregar o reconhecedor"))?;
+            self.check(captured)?;
+            *guard = Some(recognizer);
+        }
+        Ok(())
+    }
+    fn ensure_tts(&self, guard: &mut Option<OfflineTts>, captured: u64) -> Result<()> {
+        self.check(captured)?;
+        if guard.is_none() {
+            let cfg = OfflineTtsConfig {
+                model: OfflineTtsModelConfig {
+                    num_threads: 4,
+                    debug: false,
+                    provider: Some("cpu".into()),
+                    kokoro: OfflineTtsKokoroModelConfig {
+                        model: Some(self.artifact(TTS_ID, "model.onnx")?),
+                        voices: Some(self.artifact(TTS_ID, "voices.bin")?),
+                        tokens: Some(self.artifact(TTS_ID, "tokens.txt")?),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let tts =
+                OfflineTts::create(&cfg).ok_or_else(|| audio_error("Falha ao carregar a voz"))?;
+            self.check(captured)?;
+            *guard = Some(tts);
+        }
+        Ok(())
+    }
+    /// Loads VAD and the selected ASR model (not TTS).
+    pub fn preload_voice(&self) -> Result<()> {
+        let captured = self.generation.load(Ordering::SeqCst);
+        self.check(captured)?;
+        {
+            let mut vad = self.lock_checked(&self.vad, captured)?;
+            self.ensure_vad(&mut vad, captured)?;
+        }
+        let mut asr = self.lock_checked(&self.asr, captured)?;
+        self.ensure_asr(&mut asr, captured)
+    }
+    /// Loads TTS only.
+    pub fn preload_tts(&self) -> Result<()> {
+        let captured = self.generation.load(Ordering::SeqCst);
+        self.check(captured)?;
+        let mut tts = self.lock_checked(&self.tts, captured)?;
+        self.ensure_tts(&mut tts, captured)
+    }
+
     pub fn status(&self) -> Result<Value> {
         Ok(serde_json::to_value(models::status(&self.paths.models()))?)
     }
@@ -237,15 +323,7 @@ impl LocalSpeech {
         let captured = self.generation.load(Ordering::SeqCst);
         check_samples(samples, VAD_FRAME)?;
         let mut vad = self.lock_checked(&self.vad, captured)?;
-        if vad.session.is_none() {
-            let path = self.artifact(VAD_ID, "silero_vad.onnx")?;
-            let session = Session::builder()
-                .and_then(|b| b.with_intra_threads(1))
-                .and_then(|b| b.with_inter_threads(1))
-                .and_then(|b| b.commit_from_file(path))
-                .map_err(|e| audio_error(format!("Falha ao carregar VAD: {e}")))?;
-            vad.session = Some(session);
-        }
+        self.ensure_vad(&mut vad, captured)?;
         self.check(captured)?;
         let mut joined = Vec::with_capacity(VAD_CONTEXT + VAD_FRAME);
         joined.extend_from_slice(&vad.context);
@@ -276,30 +354,7 @@ impl LocalSpeech {
         check_samples(samples, MAX_ASR_SAMPLES)?;
         self.check(captured)?;
         let mut guard = self.lock_checked(&self.asr, captured)?;
-        if guard.is_none() {
-            let (id, prefix) = (self.asr_model.id(), self.asr_model.prefix());
-            let encoder = self.artifact(id, &format!("{prefix}-encoder.int8.onnx"))?;
-            let decoder = self.artifact(id, &format!("{prefix}-decoder.int8.onnx"))?;
-            let tokens = self.artifact(id, &format!("{prefix}-tokens.txt"))?;
-            let mut cfg = OfflineRecognizerConfig::default();
-            cfg.model_config.whisper = OfflineWhisperModelConfig {
-                encoder: Some(encoder),
-                decoder: Some(decoder),
-                language: Some("pt".into()),
-                task: Some("transcribe".into()),
-                tail_paddings: 0,
-                enable_token_timestamps: false,
-                enable_segment_timestamps: false,
-            };
-            cfg.model_config.tokens = Some(tokens);
-            cfg.model_config.provider = Some("cpu".into());
-            cfg.model_config.debug = false;
-            cfg.model_config.num_threads = self.asr_model.threads();
-            *guard = Some(
-                OfflineRecognizer::create(&cfg)
-                    .ok_or_else(|| audio_error("Falha ao carregar o reconhecedor"))?,
-            );
-        }
+        self.ensure_asr(&mut guard, captured)?;
         self.check(captured)?;
         let recognizer = guard.as_ref().ok_or_else(busy)?;
         let stream = recognizer.create_stream();
@@ -317,26 +372,7 @@ impl LocalSpeech {
         validate_synthesis(text, voice, speed)?;
         self.check(captured)?;
         let mut guard = self.lock_checked(&self.tts, captured)?;
-        if guard.is_none() {
-            let cfg = OfflineTtsConfig {
-                model: OfflineTtsModelConfig {
-                    num_threads: 4,
-                    debug: false,
-                    provider: Some("cpu".into()),
-                    kokoro: OfflineTtsKokoroModelConfig {
-                        model: Some(self.artifact(TTS_ID, "model.onnx")?),
-                        voices: Some(self.artifact(TTS_ID, "voices.bin")?),
-                        tokens: Some(self.artifact(TTS_ID, "tokens.txt")?),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            *guard = Some(
-                OfflineTts::create(&cfg).ok_or_else(|| audio_error("Falha ao carregar a voz"))?,
-            );
-        }
+        self.ensure_tts(&mut guard, captured)?;
         self.check(captured)?;
         let tts = guard.as_ref().ok_or_else(busy)?;
         let phonemes = piper_phonemize::phonemize(text, PHONEMIZER_LANG)
@@ -740,6 +776,47 @@ mod tests {
         // A waiter holding the current generation still succeeds.
         let current = s.generation.load(Ordering::SeqCst);
         assert!(s.lock_checked(&s.asr, current).is_ok());
+    }
+
+    #[test]
+    fn preload_reports_missing_models_and_preview_needs_only_tts() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = speech(dir.path());
+        let msg = |id: &str| format!("Instale {id} em Configurações > Modelos locais");
+        let e = s.preload_voice().unwrap_err();
+        assert_eq!(
+            (e.code.as_str(), e.message),
+            ("MODEL_NOT_INSTALLED", msg("silero-vad"))
+        );
+        let e = s.preload_tts().unwrap_err();
+        assert_eq!(
+            (e.code.as_str(), e.message),
+            ("MODEL_NOT_INSTALLED", msg("kokoro-multi-lang-v1_0"))
+        );
+        assert!(s.asr.lock().unwrap().is_none());
+        assert!(s.tts.lock().unwrap().is_none());
+        assert!(s.vad.lock().unwrap().session.is_none());
+    }
+
+    #[test]
+    fn ensure_helpers_reject_stale_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = speech(dir.path());
+        let captured = s.generation.load(Ordering::SeqCst);
+        s.cancel();
+        assert_eq!(
+            s.ensure_tts(&mut None, captured).unwrap_err().code,
+            "CANCELLED"
+        );
+        assert_eq!(
+            s.ensure_asr(&mut None, captured).unwrap_err().code,
+            "CANCELLED"
+        );
+        let mut vad = VadModel::new();
+        assert_eq!(
+            s.ensure_vad(&mut vad, captured).unwrap_err().code,
+            "CANCELLED"
+        );
     }
 
     #[test]

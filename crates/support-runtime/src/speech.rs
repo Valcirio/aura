@@ -7,6 +7,26 @@ use std::{
     sync::Mutex,
 };
 
+#[cfg(feature = "local-speech")]
+pub(crate) type SpeechBackend = crate::local_speech::LocalSpeech;
+#[cfg(not(feature = "local-speech"))]
+pub(crate) type SpeechBackend = SpeechWorker;
+
+#[cfg(feature = "local-speech")]
+pub(crate) fn backend(paths: Paths, asr_model: &str) -> SpeechBackend {
+    use crate::local_speech::AsrModel;
+    let model = if asr_model == "small" {
+        AsrModel::Small
+    } else {
+        AsrModel::Turbo
+    };
+    SpeechBackend::with_asr_model(paths, model)
+}
+#[cfg(not(feature = "local-speech"))]
+pub(crate) fn backend(paths: Paths, _asr_model: &str) -> SpeechBackend {
+    SpeechWorker::new(paths)
+}
+
 struct WorkerIo {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -139,6 +159,12 @@ impl SpeechWorker {
             }
         }
     }
+    pub fn preload_voice(&self) -> Result<()> {
+        Ok(())
+    }
+    pub fn preload_tts(&self) -> Result<()> {
+        Ok(())
+    }
     pub fn status(&self) -> Result<Value> {
         self.request(json!({"command":"status"}), |_| {})
     }
@@ -161,6 +187,11 @@ impl SpeechWorker {
         Ok(value["text"].as_str().unwrap_or("").to_string())
     }
     pub fn synthesize(&self, text: &str, voice: &str, speed: f32) -> Result<Pcm> {
+        let voice = if voice == "pf_dora" {
+            "pt_BR-cadu-medium"
+        } else {
+            voice
+        };
         let value = self.request(
             json!({"command":"synthesize","text":text,"voice":voice,"speed":speed}),
             |_| {},
