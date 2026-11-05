@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use support_core::{
-    calendar::{EventDraft, validate_interval},
+    calendar::{EventDraft, GOOGLE_CALENDAR, validate_interval},
     memory::Memory,
     store::{ConnectionInfo, Operation},
 };
@@ -79,7 +79,7 @@ impl GoogleClient {
     }
     pub fn status(&self) -> Result<ServiceStatus> {
         Ok(ServiceStatus {
-            connection: database(&self.db)?.connection_info()?,
+            connection: database(&self.db)?.connection_info(GOOGLE_CALENDAR)?,
             connecting: self
                 .pending
                 .lock()
@@ -102,7 +102,10 @@ impl GoogleClient {
                 "Informe o client ID de um cliente OAuth Desktop do Google",
             ));
         }
-        if database(&self.db)?.connection_info()?.is_some() {
+        if database(&self.db)?
+            .connection_info(GOOGLE_CALENDAR)?
+            .is_some()
+        {
             return Err(AppError::new(
                 "ALREADY_CONNECTED",
                 "Desconecte a conta atual antes de conectar outra",
@@ -292,7 +295,7 @@ impl GoogleClient {
             .vault
             .set(TOKEN_KEY, &serde_json::to_string(&tokens)?)
             .await?;
-        database(&self.db)?.save_connection(&account, &account)?;
+        database(&self.db)?.save_connection(GOOGLE_CALENDAR, &account, &account)?;
         *self.tokens.lock().await = Some(tokens);
         self.persistent
             .store(persistent, std::sync::atomic::Ordering::Relaxed);
@@ -300,9 +303,11 @@ impl GoogleClient {
     }
     async fn access_token(&self, force: bool) -> Result<String> {
         let _guard = self.auth_serial.lock().await;
-        let connection = database(&self.db)?.connection_info()?.ok_or_else(|| {
-            AppError::new("AUTH_REQUIRED", "Conecte sua conta Google em Serviços")
-        })?;
+        let connection = database(&self.db)?
+            .connection_info(GOOGLE_CALENDAR)?
+            .ok_or_else(|| {
+                AppError::new("AUTH_REQUIRED", "Conecte sua conta Google em Integrações")
+            })?;
         let mut tokens = self.tokens.lock().await;
         if tokens.is_none() {
             if let Some(stored) = self.vault.get(TOKEN_KEY).await? {
@@ -374,7 +379,7 @@ impl GoogleClient {
                 .and_then(|s| serde_json::from_str::<Tokens>(&s).ok())
                 .map(|t| t.refresh_token)
         };
-        database(&self.db)?.remove_connection()?;
+        database(&self.db)?.remove_connection(GOOGLE_CALENDAR)?;
         self.vault.remove(TOKEN_KEY).await?;
         self.persistent
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -631,8 +636,9 @@ pub async fn confirm_operation(
             "Proposta expirada ou já processada. Prepare uma nova proposta.",
         ));
     }
-    ensure_writable(api, &operation.event.calendar_id).await?;
-    let busy = busy_for(api, &operation.event).await?;
+    let event: EventDraft = operation.payload_as()?;
+    ensure_writable(api, &event.calendar_id).await?;
+    let busy = busy_for(api, &event).await?;
     if operation.result.as_ref() != Some(&busy) {
         database(db)?.operation_context(id, &busy)?;
         return Err(AppError::new(
@@ -641,7 +647,7 @@ pub async fn confirm_operation(
         ));
     }
     let operation = database(db)?.claim_operation(id, session, account, crate::now())?;
-    match api.create(&operation.event, &operation.id).await {
+    match api.create(&event, &operation.id).await {
         Ok(event) if event["id"]==id => database(db)?.finish_operation(id, "completed", Some(&event)),
         Ok(_) => database(db)?.finish_operation(id,"unknown",Some(&json!({"error":"O serviço não retornou o identificador esperado; verifique o resultado antes de tentar novamente"}))),
         Err(error) if error.code == "CONFLICT" => reconcile_operation(db, api, id, account).await,
@@ -669,7 +675,8 @@ pub async fn reconcile_operation(
             "Reconecte a conta original para verificar esta operação",
         ));
     }
-    match api.get_event(&op.event.calendar_id, id).await {
+    let event: EventDraft = op.payload_as()?;
+    match api.get_event(&event.calendar_id, id).await {
         Ok(value) if value["status"] == "cancelled" => database(db)?.finish_operation(
             id,
             "failed",
@@ -701,10 +708,11 @@ pub async fn retry_operation(
             "Tentativa inválida para essa conta ou sessão",
         ));
     }
-    match api.get_event(&op.event.calendar_id, id).await {
+    let event: EventDraft = op.payload_as()?;
+    match api.get_event(&event.calendar_id, id).await {
         Err(error) if error.code == "NOT_FOUND" => {
-            ensure_writable(api, &op.event.calendar_id).await?;
-            let busy = busy_for(api, &op.event).await?;
+            ensure_writable(api, &event.calendar_id).await?;
+            let busy = busy_for(api, &event).await?;
             database(db)?.retry_operation(id, session, account, &busy, crate::now())
         }
         Ok(_) => reconcile_operation(db, api, id, account).await,
@@ -792,7 +800,7 @@ mod tests {
             };
             let op = database(&db)
                 .unwrap()
-                .prepare_operation(session, "a", &draft, crate::now())
+                .prepare_calendar_event(session, "a", &draft, crate::now())
                 .unwrap();
             database(&db)
                 .unwrap()
@@ -820,7 +828,7 @@ mod tests {
         };
         let op = database(&db)
             .unwrap()
-            .prepare_operation(session, "a", &draft, crate::now())
+            .prepare_calendar_event(session, "a", &draft, crate::now())
             .unwrap();
         database(&db)
             .unwrap()
@@ -847,7 +855,7 @@ mod tests {
         };
         let op = database(&db)
             .unwrap()
-            .prepare_operation(session, "a", &draft, crate::now())
+            .prepare_calendar_event(session, "a", &draft, crate::now())
             .unwrap();
         assert!(
             confirm_operation(&db, &api, &op.id, session, "b")

@@ -1,4 +1,9 @@
-use crate::error::{AppError, Result};
+use crate::{
+    error::{AppError, Result},
+    memory::Memory,
+    store::{NewOperation, Operation},
+    tools::{ActionField, Effect},
+};
 use jiff::{
     Timestamp,
     civil::{Date, DateTime},
@@ -6,6 +11,9 @@ use jiff::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+pub const GOOGLE_CALENDAR: &str = "google_calendar";
+pub const CREATE_EVENT_TOOL: &str = "calendar_create_event";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +130,48 @@ impl EventDraft {
             start.strftime("%Y-%m-%dT%H:%M:%S%:z").to_string(),
             end.strftime("%Y-%m-%dT%H:%M:%S%:z").to_string(),
         ))
+    }
+}
+
+impl EventDraft {
+    pub fn action_fields(&self) -> Vec<ActionField> {
+        vec![
+            ActionField::new(
+                "Agenda",
+                if self.calendar_id == "primary" {
+                    "Principal".to_string()
+                } else {
+                    self.calendar_id.clone()
+                },
+            ),
+            ActionField::new("Início", self.start.clone()),
+            ActionField::new("Término", self.end.clone()),
+            ActionField::new("Fuso", self.time_zone.clone()),
+        ]
+    }
+}
+
+impl Memory {
+    pub fn prepare_calendar_event(
+        &mut self,
+        session: i64,
+        account: &str,
+        draft: &EventDraft,
+        now: i64,
+    ) -> Result<Operation> {
+        self.prepare_operation(
+            &NewOperation {
+                session,
+                integration: GOOGLE_CALENDAR,
+                account,
+                tool: CREATE_EVENT_TOOL,
+                effect: Effect::ExternalWrite,
+                summary: &draft.summary,
+                fields: &draft.action_fields(),
+                payload: &serde_json::to_value(draft)?,
+            },
+            now,
+        )
     }
 }
 

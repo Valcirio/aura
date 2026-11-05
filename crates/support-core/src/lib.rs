@@ -5,5 +5,5 @@ pub mod conversation;
 pub mod error;
 pub mod memory;
 pub mod models;
-pub mod services;
 pub mod store;
+pub mod tools;

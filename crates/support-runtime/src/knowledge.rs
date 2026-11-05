@@ -1,3 +1,4 @@
+use crate::integrations::{Integration, IntegrationRegistry};
 use crate::{
     AppError, Result,
     google::{Database, database},
@@ -5,14 +6,13 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use support_core::services::{GoogleCalendar, ServiceAdapter, ServiceRegistry};
 
 pub fn seed(db: &Database) -> Result<()> {
     if database(db)?.document_count("google_calendar")? > 0 {
         return Ok(());
     }
     database(db)?.replace_document("google_calendar","https://developers.google.com/workspace/calendar/api/guides/overview?hl=pt-br","Google Calendar — visão geral (resumo local)",
-        "O Google Calendar permite consultar agendas, listar eventos, consultar disponibilidade e criar compromissos. Neste aplicativo, conecte uma conta Google em Serviços. Para criar um compromisso, informe título, agenda, início e término. Toda criação exige confirmação. Um resumo de conversa não prova a situação atual da agenda; consulte os dados atuais pela ferramenta Calendar. Este é um resumo local: atualize a documentação oficial para mais detalhes.","resumo local")?;
+        "O Google Calendar permite consultar agendas, listar eventos, consultar disponibilidade e criar compromissos. Neste aplicativo, conecte uma conta Google em Integrações. Para criar um compromisso, informe título, agenda, início e término. Toda criação exige confirmação. Um resumo de conversa não prova a situação atual da agenda; consulte os dados atuais pela ferramenta Calendar. Este é um resumo local: atualize a documentação oficial para mais detalhes.","resumo local")?;
     Ok(())
 }
 
@@ -24,19 +24,19 @@ pub struct RefreshReport {
 pub async fn refresh(
     client: &reqwest::Client,
     db: &Database,
-    registry: &ServiceRegistry,
-    service: &str,
+    registry: &IntegrationRegistry,
+    integration: &str,
 ) -> Result<RefreshReport> {
-    let adapter = registry.get(service)?;
+    let adapter = registry.get(integration)?;
     let mut report = RefreshReport {
         updated: 0,
         failures: Vec::new(),
     };
     for source in adapter.manifest().documentation {
-        match fetch_document(client, adapter, &source).await {
+        match fetch_document(client, adapter.as_ref(), &source).await {
             Ok((title, text)) => {
                 database(db)?.replace_document(
-                    service,
+                    integration,
                     &source,
                     &title,
                     &text,
@@ -51,7 +51,7 @@ pub async fn refresh(
 }
 async fn fetch_document(
     client: &reqwest::Client,
-    adapter: &dyn ServiceAdapter,
+    adapter: &dyn Integration,
     source: &str,
 ) -> Result<(String, String)> {
     let mut url = source.to_string();
@@ -206,13 +206,6 @@ pub async fn web_search(
         Some(json!({"source_id":format!("web:{index}"),"url":url,"title":item["title"],"text":item["description"],"published":item["page_age"],"retrieved_at":jiff::Timestamp::now().to_string(),"kind":"web"}))
     }).collect::<Vec<_>>();
     Ok(json!({"sources":results}))
-}
-
-pub fn builtin_registry() -> ServiceRegistry {
-    ServiceRegistry::default()
-}
-pub fn official_sources() -> Vec<String> {
-    GoogleCalendar.manifest().documentation
 }
 
 #[cfg(test)]

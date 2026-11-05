@@ -19,8 +19,6 @@ extern "C" {
     fn dispose_stream_js(id: u32);
     #[wasm_bindgen(js_name=applyOrbLevel)]
     fn orb_level(level: f64);
-    #[wasm_bindgen(js_name=formatDate)]
-    fn format_date(value: &str, time_zone: &str, all_day: bool, exclusive_end: bool) -> String;
 }
 
 static NEXT_STREAM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -79,6 +77,8 @@ struct Ui {
     memory_query: RwSignal<String>,
     memory_results: RwSignal<Vec<Value>>,
     service: RwSignal<Value>,
+    integrations: RwSignal<Vec<Value>>,
+    tools: RwSignal<Vec<(String, String, String)>>,
     calendars: RwSignal<Vec<Value>>,
     models: RwSignal<Vec<String>>,
     provider_state: RwSignal<&'static str>,
@@ -121,6 +121,8 @@ impl Ui {
             memory_query: RwSignal::new(String::new()),
             memory_results: RwSignal::new(Vec::new()),
             service: RwSignal::new(json!({})),
+            integrations: RwSignal::new(Vec::new()),
+            tools: RwSignal::new(Vec::new()),
             calendars: RwSignal::new(Vec::new()),
             models: RwSignal::new(Vec::new()),
             provider_state: RwSignal::new("unavailable"),
@@ -323,7 +325,12 @@ impl Ui {
     }
     async fn refresh_service(self) -> Result<(), String> {
         self.service
-            .set(request("service_status", json!({})).await?);
+            .set(request("integration_status", json!({})).await?);
+        Ok(())
+    }
+    async fn refresh_integrations(self) -> Result<(), String> {
+        self.integrations
+            .set(array(&request("integration_list", json!({})).await?));
         Ok(())
     }
     async fn refresh_models(self) -> Result<(), String> {
@@ -363,15 +370,12 @@ impl Ui {
     }
     async fn new_session(self) -> Result<i64, String> {
         self.stop().await?;
-        let session = request(
-            "session_create",
-            json!({"title":"Conversa · Google Calendar"}),
-        )
-        .await?;
+        let session = request("session_create", json!({"title":"Conversa"})).await?;
         let id = session["id"].as_i64().ok_or("Sessão inválida")?;
         self.session.set(id);
         self.messages.set(Vec::new());
         self.sources.set(Vec::new());
+        self.tools.set(Vec::new());
         self.operation.set(Value::Null);
         self.page.set("conversation");
         self.refresh_sessions().await?;
@@ -522,6 +526,7 @@ impl Ui {
         self.generation.set(accepted);
         if event["kind"] == "run.started" {
             self.running.set(true);
+            self.tools.set(Vec::new());
         }
         let payload = &event["payload"];
         let turn = text(&event, "turn_id");
@@ -550,6 +555,23 @@ impl Ui {
                             role: "assistant".into(),
                             text: delta,
                         });
+                    }
+                });
+            }
+            "tool.started" => self.tools.update(|t| {
+                t.push((
+                    text(payload, "name"),
+                    text(payload, "label"),
+                    "running".into(),
+                ))
+            }),
+            "tool.completed" => {
+                let name = text(payload, "name");
+                let status = if payload["ok"] == true { "ok" } else { "error" };
+                self.tools.update(|t| {
+                    if let Some(row) = t.iter_mut().rev().find(|r| r.0 == name && r.2 == "running")
+                    {
+                        row.2 = status.into();
                     }
                 });
             }
@@ -966,9 +988,9 @@ fn state_copy(state: &str) -> (&'static str, &'static str) {
         "knowledge" => ("Documentação", "Buscando uma orientação oficial."),
         "memory" => ("Memória", "Lembrando o que já conversamos."),
         "searching" => ("Pesquisando", "Buscando mais informações."),
-        "consulting" => ("Consultando agenda", "Verificando seus compromissos."),
-        "awaiting_confirmation" => ("Aguardando confirmação", "Confira antes de salvar."),
-        "executing" => ("Salvando", "Criando seu compromisso."),
+        "consulting" => ("Consultando", "Verificando suas informações."),
+        "awaiting_confirmation" => ("Aguardando confirmação", "Confira antes de confirmar."),
+        "executing" => ("Executando", "Realizando a ação confirmada."),
         "speaking" => ("Respondendo", "Uma resposta para ouvir."),
         "error" => ("Algo precisa de atenção", "Vamos tentar de novo?"),
         _ => ("Pronta para começar", "Como posso ajudar?"),
@@ -980,7 +1002,7 @@ pub fn App() -> impl IntoView {
     let ui = Ui::new();
     Effect::new(move || {
         if !desktop() {
-            ui.notice.set("Esta é a interface Leptos. Abra o aplicativo Tauri para conectar modelos, áudio e Google Calendar.".into());
+            ui.notice.set("Esta é a interface Leptos. Abra o aplicativo Tauri para conectar modelos, áudio e integrações.".into());
             return;
         }
         ui.task(async move {
@@ -989,6 +1011,7 @@ pub fn App() -> impl IntoView {
             ui.start_check();
             ui.refresh_sessions().await?;
             ui.refresh_service().await?;
+            ui.refresh_integrations().await?;
             ui.refresh_devices().await;
             if let Err(error) = ui.refresh_models().await {
                 ui.notice.set(error);
@@ -1021,18 +1044,18 @@ pub fn App() -> impl IntoView {
     view! {
         <div class="app" data-state=move||ui.state.get()>
             <aside class="sidebar"><div class="brand"><span class="brand-icon"></span><span class="brand-text">"aura"</span></div><div class="eyebrow">"Seu espaço de conversa"</div>
-                <nav class="nav" aria-label="Navegação principal"><Nav ui page="conversation" symbol="◯" label="Conversa"/><Nav ui page="memory" symbol="◷" label="Memória"/><Nav ui page="services" symbol="◇" label="Serviços"/><Nav ui page="settings" symbol="⚙" label="Configurações"/></nav>
+                <nav class="nav" aria-label="Navegação principal"><Nav ui page="conversation" symbol="◯" label="Conversa"/><Nav ui page="memory" symbol="◷" label="Memória"/><Nav ui page="integrations" symbol="◇" label="Integrações"/><Nav ui page="settings" symbol="⚙" label="Configurações"/></nav>
                 <div class="sidebar-bottom"><p><span class="local-dot"></span>"Áudio local · sua escolha de modelo"</p><div class="sidebar-note">"Uma conversa de cada vez."<br/>"Com calma. Com contexto."</div></div>
             </aside>
-            <main class="workspace"><header class="topbar"><div class="breadcrumb">"Seu assistente"<span>"/ Google Calendar"</span></div><div class="header-status"><span class="pill">{move||if ui.running.get(){state_copy(&ui.state.get()).0}else{match ui.provider_state.get(){"checking"=>"Verificando modelo…","ready"=>"Compatibilidade validada",_=>"Modelo indisponível"}}}</span><Show when=move||ui.provider_state.get()=="unavailable"&&!ui.running.get()><button class="text-button" on:click=move |_|ui.start_check()>"Tentar novamente"</button></Show><Show when=move||ui.running.get()||ui.notices.get().in_flight><button class="text-button" on:click=move |_|ui.task(async move{ui.stop().await})>"Parar"</button></Show></div></header>
+            <main class="workspace"><header class="topbar"><div class="breadcrumb">"Aura"<span>"/ Assistente"</span></div><div class="header-status"><span class="pill">{move||if ui.running.get(){state_copy(&ui.state.get()).0}else{match ui.provider_state.get(){"checking"=>"Verificando modelo…","ready"=>"Compatibilidade validada",_=>"Modelo indisponível"}}}</span><Show when=move||ui.provider_state.get()=="unavailable"&&!ui.running.get()><button class="text-button" on:click=move |_|ui.start_check()>"Tentar novamente"</button></Show><Show when=move||ui.running.get()||ui.notices.get().in_flight><button class="text-button" on:click=move |_|ui.task(async move{ui.stop().await})>"Parar"</button></Show></div></header>
                 <div class="content"><Show when=move||!ui.notice.get().is_empty()><div class="notice" role="status">{move||ui.notice.get()}</div></Show>
                     <Show when=move||ui.provider_state.get()=="unavailable"&&!ui.provider_error.get().is_empty()><div class="notice" role="alert">{move||ui.provider_error.get()}<button class="text-button" on:click=move |_|ui.start_check()>"Tentar novamente"</button></div></Show>
                     <Show when=move||speech_notice_visible(&ui.speech.get())><div class="notice" role="status">{move||speech_message(&ui.speech.get()).unwrap_or_default()}<Show when=move||speech_can_retry(&ui.speech.get())><button class="text-button" on:click=move |_|ui.start_speech()>"Tentar novamente"</button></Show></div></Show>
                     <section class="page" hidden=move||ui.page.get()!="conversation"><Conversation ui/></section>
                     <section class="page" hidden=move||ui.page.get()!="memory"><MemoryPage ui/></section>
-                    <section class="page" hidden=move||ui.page.get()!="services"><ServicesPage ui/></section>
+                    <section class="page" hidden=move||ui.page.get()!="integrations"><IntegrationsPage ui/></section>
                     <section class="page" hidden=move||ui.page.get()!="settings"><SettingsPage ui/></section>
-                    <footer class="footer"><span>"Whisper + Kokoro · processamento local de áudio"</span><span>"Sua agenda só muda após confirmação"</span></footer>
+                    <footer class="footer"><span>"Whisper + Kokoro · processamento local de áudio"</span><span>"Ações externas só acontecem após sua confirmação"</span></footer>
                 </div>
             </main>
         </div>
@@ -1047,10 +1070,10 @@ fn Nav(ui: Ui, page: &'static str, symbol: &'static str, label: &'static str) ->
 #[component]
 fn Conversation(ui: Ui) -> impl IntoView {
     view! {
-        <div class="page-heading"><div><div class="eyebrow">"Aqui para ouvir"</div><h1>"Vamos conversar."</h1><div class="subtitle">"Sua voz, sua agenda, suas respostas."</div></div><button class="text-button" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{ui.new_session().await?;Ok(())})>"+ Nova conversa"</button></div>
+        <div class="page-heading"><div><div class="eyebrow">"Aqui para ouvir"</div><h1>"Vamos conversar."</h1><div class="subtitle">"Sua voz, suas ações, suas respostas."</div></div><button class="text-button" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{ui.new_session().await?;Ok(())})>"+ Nova conversa"</button></div>
         <div class="voice-stage"><div class="orb-scene" aria-hidden="true"><div class="orbit"></div><div class="orbit"></div><div class="orb"></div></div>
             <div class="state-label">{move||state_copy(&ui.state.get()).0}</div><h2 class="stage-title">{move||state_copy(&ui.state.get()).1}</h2>
-            <p class="stage-description" role="status" aria-live="polite">{move||if ui.running.get(){"Interrompa a resposta pelo botão. Ao terminar, volto a ouvir."}else{"Converse sobre o Calendar, consulte compromissos ou prepare um novo evento."}}</p>
+            <p class="stage-description" role="status" aria-live="polite">{move||if ui.running.get(){"Interrompa a resposta pelo botão. Ao terminar, volto a ouvir."}else{"Peça o que precisar: consultar a agenda, pesquisar, lembrar conversas anteriores e mais."}}</p>
             <div class="stage-controls"><button class="primary" disabled=move||ui.busy.get()||ui.running.get() on:click=move |_|ui.voice_start()>"● Começar conversa"</button>
                 <button class="secondary" hidden=move||ui.state.get()!="listening" on:click=move |_|ui.task(async move{request("conversation_finish_input",json!({})).await?;Ok(())})>"Concluir fala"</button>
                 <button class="round" aria-label="Interromper áudio e conversa" on:click=move |_|ui.task(async move{ui.stop().await})>"■"</button></div>
@@ -1063,8 +1086,9 @@ fn Conversation(ui: Ui) -> impl IntoView {
             <div class="config-card"><span class="config-icon">"≋"</span><div class="config-copy"><label for="active-voice">"Voz da resposta"</label><select id="active-voice" disabled=move||ui.running.get()||!settings_loaded(ui) on:change=move|ev|{ui.set("voice",json!(event_target_value(&ev)));ui.task(async move{ui.save().await});}>{move||choice_options(ui,"voice")}</select></div></div></div>
         <ActionCard ui/>
         <section class="conversation-preview"><div class="section-header"><h2>"A conversa, por escrito"</h2><span class="fine-print">{move||if ui.session.get()==0{"Nova conversa".into()}else{format!("Sessão {}",ui.session.get())}}</span></div>
-            <Show when=move||ui.messages.get().is_empty()><p class="empty">"Experimente: “Quais compromissos tenho amanhã?” ou “Como funcionam os lembretes do Google Calendar?”"</p></Show>
+            <Show when=move||ui.messages.get().is_empty()><p class="empty">"Experimente: “O que tenho amanhã na agenda?”, “Pesquise as novidades do Rust 2024” ou “Do que falamos ontem?”"</p></Show>
             <div class="transcript" aria-live="off">{move||ui.messages.get().into_iter().map(|message|view!{<div class="transcript-line"><span class="avatar">{if message.role=="user"{"V"}else{"a"}}</span><p><strong>{if message.role=="user"{"Você"}else{"Aura"}}</strong>{message.text}</p></div>}).collect_view()}</div>
+            <Show when=move||!ui.tools.get().is_empty()><ul class="tool-activity" aria-live="polite">{move||ui.tools.get().into_iter().map(|(_,label,status)|view!{<li>{match status.as_str(){"ok"=>format!("✓ {label}"),"error"=>format!("✗ {label}"),_=>format!("{label}…")}}</li>}).collect_view()}</ul></Show>
             <Show when=move||ui.more_messages.get()><button class="text-button" disabled=move||ui.running.get()||ui.busy.get() on:click=move |_|ui.task(async move{ui.load_messages(ui.message_cursor.get_untracked()).await})>"Carregar mais mensagens"</button></Show>
             <form class="message-form" on:submit=move|ev|{ev.prevent_default();if ui.provider_state.get_untracked()!="ready"{return;}let text=ui.input.get_untracked();ui.task(async move{ui.start(Some(text)).await});}><label class="sr-only" for="message">"Escreva sua mensagem"</label><input id="message" placeholder="Ou escreva uma mensagem…" maxlength="12000" prop:value=move||ui.input.get() on:input=move|ev|ui.input.set(event_target_value(&ev))/><button class="primary" disabled=move||ui.busy.get()||ui.provider_state.get()!="ready"||ui.input.get().trim().is_empty()>"Enviar"</button></form>
             <Sources ui/>
@@ -1074,10 +1098,10 @@ fn Conversation(ui: Ui) -> impl IntoView {
 
 #[component]
 fn ActionCard(ui: Ui) -> impl IntoView {
-    view! {<Show when=move||!ui.operation.get().is_null()>{move||{let op=ui.operation.get();let event=&op["event"];let status=text(&op,"status");let pending=status=="awaiting_confirmation";let conflicts=op["result"]["busy"].as_array().is_some_and(|a|!a.is_empty());let reconcile=status=="unknown"||status=="executing";
-        view!{<section class="panel action-card" aria-label="Proposta de compromisso"><div class="eyebrow">{if pending{"Confira antes de salvar"}else{"Resultado da operação"}}</div><h2>{text(event,"summary")}</h2><dl><dt>"Agenda"</dt><dd>{if event["calendar_id"]=="primary"{"Principal".into()}else{text(event,"calendar_id")}}</dd><dt>"Início"</dt><dd>{format_date(&text(event,"start"),&text(event,"time_zone"),event["all_day"]==true,false)}</dd><dt>"Término"</dt><dd>{format_date(&text(event,"end"),&text(event,"time_zone"),event["all_day"]==true,true)}</dd><dt>"Fuso"</dt><dd>{text(event,"time_zone")}</dd></dl>
-            <p class="subtitle">{match status.as_str(){"awaiting_confirmation"=>"O evento ainda não foi criado. Confirme por voz ou pelo botão.","completed"=>"Criação confirmada pelo Google Calendar.","unknown"=>"O resultado ainda não foi confirmado. Verifique antes de tentar novamente.","executing"=>"A criação está em andamento.","cancelled"=>"Proposta cancelada. Nenhum evento foi criado por esta proposta.",_=>"Não foi possível concluir esta operação."}}</p>
-            <Show when=move||pending><Show when=move||conflicts><p class="conflict-note">"Há compromissos nesse intervalo. Confirmar salvará mesmo com sobreposição."</p></Show><div class="page-actions"><button class="primary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{ui.action("action_confirm").await})>"Confirmar e salvar"</button><button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{ui.action("action_cancel").await})>"Cancelar"</button></div></Show>
+    view! {<Show when=move||!ui.operation.get().is_null()>{move||{let op=ui.operation.get();let status=text(&op,"status");let pending=status=="awaiting_confirmation";let conflicts=op["result"]["busy"].as_array().is_some_and(|a|!a.is_empty());let reconcile=status=="unknown"||status=="executing";
+        view!{<section class="panel action-card" aria-label="Ação pendente"><div class="eyebrow">{if pending{"Confira antes de confirmar"}else{"Resultado da ação"}}</div><h2>{text(&op,"summary")}</h2><dl>{array(&op["fields"]).into_iter().map(|f|view!{<dt>{text(&f,"label")}</dt><dd>{text(&f,"value")}</dd>}).collect_view()}</dl>
+            <p class="subtitle">{match status.as_str(){"awaiting_confirmation"=>"A ação ainda não foi executada. Confirme por voz ou pelo botão.","completed"=>"Ação concluída e confirmada.","unknown"=>"O resultado ainda não foi confirmado. Verifique antes de tentar novamente.","executing"=>"A ação está em andamento.","cancelled"=>"Proposta cancelada. Nada foi executado.",_=>"Não foi possível concluir esta ação."}}</p>
+            <Show when=move||pending><Show when=move||conflicts><p class="conflict-note">"Há compromissos nesse intervalo. Confirmar prosseguirá mesmo com sobreposição."</p></Show><div class="page-actions"><button class="primary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{ui.action("action_confirm").await})>"Confirmar"</button><button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{ui.action("action_cancel").await})>"Cancelar"</button></div></Show>
             <Show when=move||reconcile><div class="page-actions"><button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{ui.action("action_reconcile").await})>"Verificar estado"</button><button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{ui.action("action_retry").await})>"Preparar nova tentativa"</button></div></Show>
         </section>}
     }}</Show>}
@@ -1095,7 +1119,7 @@ fn Sources(ui: Ui) -> impl IntoView {
 #[component]
 fn MemoryPage(ui: Ui) -> impl IntoView {
     view! {<div class="page-heading"><div><div class="eyebrow">"Contexto que acompanha"</div><h1>"Sua memória."</h1><p class="subtitle">"Busque e retome conversas armazenadas neste computador."</p></div></div>
-    <div class="panel"><form on:submit=move|ev|{ev.prevent_default();ui.task(async move{ui.memory_results.set(array(&request("memory_search",json!({"query":ui.memory_query.get_untracked()})).await?));Ok(())});}><label class="field">"O que você quer lembrar?"<input type="search" placeholder="Ex.: reunião, lembretes, agenda" prop:value=move||ui.memory_query.get() on:input=move|ev|ui.memory_query.set(event_target_value(&ev))/></label><button class="primary" disabled=move||ui.busy.get()>"Buscar na memória"</button></form>
+    <div class="panel"><form on:submit=move|ev|{ev.prevent_default();ui.task(async move{ui.memory_results.set(array(&request("memory_search",json!({"query":ui.memory_query.get_untracked()})).await?));Ok(())});}><label class="field">"O que você quer lembrar?"<input type="search" placeholder="Ex.: reunião, projeto, decisão" prop:value=move||ui.memory_query.get() on:input=move|ev|ui.memory_query.set(event_target_value(&ev))/></label><button class="primary" disabled=move||ui.busy.get()>"Buscar na memória"</button></form>
         {move||ui.memory_results.get().into_iter().map(|result|{let session=result["session_id"].as_i64().unwrap_or(0);view!{<div class="result"><p>{text(&result,"text")}</p><small>{text(&result,"created_at")}</small><button class="text-button" on:click=move |_|ui.task(async move{ui.open_session(session).await})>"Abrir conversa"</button></div>}}).collect_view()}</div>
     <div class="panel"><div class="section-header"><h2>"Conversas"</h2><button class="text-button" on:click=move |_|ui.task(async move{ui.refresh_sessions().await})>"Atualizar"</button></div>
         <Show when=move||ui.sessions.get().is_empty()><p class="empty">"Sua primeira conversa aparecerá aqui."</p></Show>
@@ -1105,27 +1129,35 @@ fn MemoryPage(ui: Ui) -> impl IntoView {
 }
 
 #[component]
-fn ServicesPage(ui: Ui) -> impl IntoView {
+fn IntegrationsPage(ui: Ui) -> impl IntoView {
     view! {
-        <div class="page-heading"><div><div class="eyebrow">"Assistência que acompanha você"</div><h1>"Seus serviços."</h1><p class="subtitle">"Google Calendar é o primeiro. Novos serviços compartilharão a mesma conversa."</p></div></div>
+        <div class="page-heading"><div><div class="eyebrow">"Assistência que acompanha você"</div><h1>"Suas integrações."</h1><p class="subtitle">"Escolha o que o assistente pode usar. Ações externas sempre pedem sua confirmação."</p></div></div>
+        <div class="panel"><div class="section-header"><h2>"Disponíveis"</h2><button class="text-button" on:click=move |_|ui.task(async move{ui.refresh_integrations().await})>"Atualizar"</button></div>
+        {move||ui.integrations.get().into_iter().map(|item|{
+            let id=text(&item,"id");let enabled=item["enabled"]==true;
+            let badge=if item["builtin"]==true{"Embutida"}else if item["connected"]==true{"Conectada"}else{"Desconectada"};
+            let tools=array(&item["tools"]).iter().map(|t|text(t,"label")).collect::<Vec<_>>().join(" · ");
+            view!{<div class="result"><div class="section-header"><strong>{text(&item,"name")}</strong><span class="pill">{badge}</span></div><p>{text(&item,"description")}</p><small>{tools}</small>
+              <label class="check-field"><input type="checkbox" prop:checked=enabled disabled=move||ui.busy.get() on:change=move|ev|{let on=event_target_checked(&ev);let id=id.clone();ui.task(async move{let r=request("integration_set_enabled",json!({"integration":id,"enabled":on})).await?;ui.set("integrations_disabled",r["integrations_disabled"].clone());ui.refresh_integrations().await})}/>"Permitir que o assistente use"</label></div>}
+        }).collect_view()}</div>
         <div class="panel"><div class="section-header"><h2>"Google Calendar"</h2><span class="pill">{move||if ui.service.get()["google_calendar"]["connection"].is_object(){"Conectado"}else{"Não conectado"}}</span></div>
             <p class="subtitle">"Consulte eventos e disponibilidade. Toda criação de compromisso pede sua confirmação."</p>
             <Show when=move||ui.service.get()["google_calendar"]["connection"].is_object()><p>{move||text(&ui.service.get()["google_calendar"]["connection"],"label")}</p></Show>
             <Show when=move||ui.service.get()["google_calendar"]["connecting"]==true><p class="subtitle">"Conclua a autorização no navegador. A conexão será atualizada automaticamente."</p></Show>
             <Show when=move||ui.service.get()["google_calendar"]["error"].is_object()><p class="conflict-note">{move||text(&ui.service.get()["google_calendar"]["error"],"message")}</p></Show>
             <div class="page-actions"><button class="primary" disabled=move||ui.busy.get()||ui.service.get()["google_calendar"]["connection"].is_object()||ui.service.get()["google_calendar"]["connecting"]==true on:click=move |_|ui.task(async move{
-                ui.save().await?;let value=request("service_connect",json!({"service_id":"google_calendar"})).await?;ui.refresh_service().await?;
+                ui.save().await?;let value=request("integration_connect",json!({"integration":"google_calendar"})).await?;ui.refresh_integrations().await?;ui.refresh_service().await?;
                 ui.notice.set(if value["browser_opened"]==true{"Autorize a conexão no navegador do sistema.".into()}else{format!("Abra no navegador: {}",text(&value,"authorization_url"))});Ok(())
-            })>"Conectar conta Google"</button><button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{request("service_disconnect",json!({"service_id":"google_calendar"})).await?;ui.calendars.set(Vec::new());ui.refresh_service().await})>"Desconectar"</button></div>
+            })>"Conectar conta Google"</button><button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{request("integration_disconnect",json!({"integration":"google_calendar"})).await?;ui.calendars.set(Vec::new());ui.refresh_integrations().await?;ui.refresh_service().await})>"Desconectar"</button></div>
             <button class="text-button" on:click=move |_|ui.page.set("settings")>"Configurar credenciais do aplicativo"</button>
         </div>
         <div class="panel"><h2>"Sua agenda"</h2><button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{let value=request("calendar_list",json!({})).await?;ui.calendars.set(array(&value["items"]));Ok(())})>"Carregar agendas"</button>
             <label class="field">"Agenda padrão"<select prop:value=move||text(&ui.settings.get(),"calendar_id") on:change=move|ev|{ui.set("calendar_id",json!(event_target_value(&ev)));ui.task(async move{ui.save().await});}><option value="primary">"Agenda principal"</option>{move||ui.calendars.get().into_iter().map(|calendar|view!{<option value=text(&calendar,"id")>{format!("{} · {}",text(&calendar,"summary"),if ["owner","writer"].contains(&calendar["accessRole"].as_str().unwrap_or("")){"permite criação"}else{"somente leitura"})}</option>}).collect_view()}</select></label>
             <button class="text-button" disabled=move||ui.busy.get()||ui.provider_state.get()!="ready" on:click=move |_|ui.task(async move{ui.page.set("conversation");ui.start(Some("Quais compromissos tenho amanhã?".into())).await})>"Consultar compromissos de amanhã →"</button>
         </div>
-        <div class="panel"><h2>"Conhecimento do serviço"</h2><p class="subtitle">"A documentação oficial orienta as respostas. A pesquisa na web pode complementar, sempre identificando as fontes."</p>
+        <div class="panel"><h2>"Documentação do Google Calendar"</h2><p class="subtitle">"A documentação oficial orienta as respostas. A pesquisa na web pode complementar, sempre identificando as fontes."</p>
             <p class="subtitle">{move||format!("{} documentos locais",ui.service.get()["documents"].as_i64().unwrap_or(0))}</p>
-            <button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{let report=request("knowledge_refresh",json!({"service_id":"google_calendar"})).await?;ui.refresh_service().await?;ui.notice.set(format!("{} documentos atualizados; {} fontes indisponíveis. Versões anteriores foram preservadas.",report["updated"],array(&report["failures"]).len()));Ok(())})>"Atualizar documentação oficial"</button>
+            <button class="secondary" disabled=move||ui.busy.get() on:click=move |_|ui.task(async move{let report=request("knowledge_refresh",json!({"integration":"google_calendar"})).await?;ui.refresh_service().await?;ui.notice.set(format!("{} documentos atualizados; {} fontes indisponíveis. Versões anteriores foram preservadas.",report["updated"],array(&report["failures"]).len()));Ok(())})>"Atualizar documentação oficial"</button>
         </div>
     }
 }
@@ -1247,7 +1279,7 @@ fn SettingsPage(ui: Ui) -> impl IntoView {
             <label class="field">"Client secret do cliente Desktop"<input type="password" autocomplete="off" placeholder="Deixe em branco para manter o valor configurado" prop:value=move||ui.google_secret.get() on:input=move|ev|ui.google_secret.set(event_target_value(&ev))/></label>
             <label class="field">"Fuso das suas falas e compromissos"<input placeholder="America/Bahia" prop:value=move||text(&ui.settings.get(),"time_zone") on:input=move|ev|ui.set("time_zone",json!(event_target_value(&ev)))/></label>
         </div>
-        <div class="panel"><h2>"Pesquisa na internet"</h2><label class="field">"Chave Brave Search"<input type="password" autocomplete="off" placeholder="Deixe em branco para manter a chave atual" prop:value=move||ui.brave_key.get() on:input=move|ev|ui.brave_key.set(event_target_value(&ev))/></label><p class="subtitle">"Somente a consulta pública é enviada à pesquisa. O agente é instruído a preservar o conteúdo privado da agenda."</p></div>
+        <div class="panel"><h2>"Pesquisa na internet"</h2><label class="field">"Chave Brave Search"<input type="password" autocomplete="off" placeholder="Deixe em branco para manter a chave atual" prop:value=move||ui.brave_key.get() on:input=move|ev|ui.brave_key.set(event_target_value(&ev))/></label><p class="subtitle">"Somente a consulta pública é enviada à pesquisa. O agente é instruído a preservar o conteúdo privado do usuário."</p></div>
         <div class="page-actions"><button class="primary" on:click=move |_|ui.task(async move{ui.save().await})>"Salvar configurações"</button></div>
         </fieldset>
     }

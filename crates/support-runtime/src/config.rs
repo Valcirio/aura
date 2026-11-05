@@ -72,6 +72,7 @@ impl ProviderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    /// Obsoleto: mantido apenas para compatibilidade do JSON persistido; não é usado.
     pub service_id: String,
     pub provider: ProviderConfig,
     pub voice: String,
@@ -83,6 +84,7 @@ pub struct Settings {
     pub output_device: Option<String>,
     pub speak_text: bool,
     pub google_client_id: String,
+    pub integrations_disabled: Vec<String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -101,6 +103,7 @@ impl Default for Settings {
             output_device: None,
             speak_text: true,
             google_client_id: String::new(),
+            integrations_disabled: Vec::new(),
         }
     }
 }

@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use support_core::tools::{Effect, ToolSpec};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,11 +351,15 @@ impl Provider {
     pub async fn probe(&self) -> Result<ProbeResult> {
         let fingerprint = self.fingerprint().await?;
         let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let definition = support_core::services::tool(
+        let definition = ToolSpec::new(
+            "builtin",
             "compatibility_echo",
+            "Teste",
             "Ferramenta de teste sem efeito externo.",
+            Effect::Read,
             json!({"type":"object","properties":{"nonce":{"type":"string"}},"required":["nonce"],"additionalProperties":false}),
-        );
+        )
+        .definition();
         let mut messages = vec![
             json!({"role":"user","content":format!("Chame obrigatoriamente compatibility_echo com nonce={nonce}. Não responda em texto antes da ferramenta.")}),
         ];

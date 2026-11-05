@@ -61,7 +61,7 @@ O adaptador de provedor suporta Ollama (`/api/chat`, NDJSON) e APIs compatíveis
 
 `provider_probe` testa de verdade uma ferramenta fictícia com nonce, seu resultado, uma resposta em português e cancelamento do stream. O resultado é ligado à configuração. Alterar configuração ou credencial invalida o teste. Ollama também fornece metadados/template usados na verificação de fingerprint. Em APIs genéricas, revisões internas do modelo que não são expostas pelo provedor não podem ser detectadas apenas pelo ID.
 
-O coordenador usa uma etapa de escolha/execução de ferramentas seguida de resposta final com ferramentas desabilitadas. Assim, dados de ferramentas e raciocínio de planejamento não são lidos em voz alta. A geração final alimenta uma fila limitada de frases, sintetizadas e reproduzidas enquanto o texto continua chegando.
+O coordenador vive no módulo `agent/` (`mod.rs` com o loop, `prompt.rs` com o prompt de sistema e `approvals.rs` com as confirmações). O modelo alterna texto e chamadas de ferramenta no mesmo turno. O texto de todas as rodadas é transmitido à interface e a uma única fila de frases por turno, sintetizada e reproduzida enquanto o texto continua chegando. Depois de uma ação proposta, ou no limite de rodadas, a última rodada roda sem ferramentas. Dados de ferramentas não são lidos em voz alta porque só o texto do assistente vai para o TTS.
 
 Limites: três rodadas, seis chamadas e concorrência de até dois especialistas. Histórico antigo e resultados extensos são reduzidos por orçamento conservador de caracteres, preservando instruções, pedido recente e pares de chamada/resultado. Não há tokenizer específico para cada API; o provedor mantém seus limites finais de tokens.
 
@@ -71,7 +71,7 @@ Cancelamento invalida a geração e propaga para requests, worker e reprodução
 
 `ServiceAdapter` define identidade, ferramentas e fontes permitidas. `ServiceExecutor` executa ferramentas com contexto de sessão, banco e cancelamento. O registro é feito em código na inicialização; não há plugins externos baixados pelo usuário. O teste de extensibilidade registra e consulta outro serviço sem mudanças no coordenador ou no áudio.
 
-Ferramentas comuns são `knowledge_search`, `memory_search`, `conversation_get` e `web_search`. O serviço ativo acrescenta suas próprias ferramentas. O Google Calendar expõe `calendar_list`, `calendar_events`, `calendar_free_busy` e `calendar_prepare_event`. O modelo não recebe ferramenta de confirmação, edição ou exclusão.
+Ferramentas comuns são `knowledge_search`, `memory_search`, `conversation_get` e `web_search`. Todas as integrações habilitadas e conectadas expõem suas ferramentas simultaneamente (`Integration`/`IntegrationRegistry`). O Google Calendar expõe `calendar_list`, `calendar_events`, `calendar_free_busy` e `calendar_create_event` (efeito `external_write`, exige confirmação). O modelo não recebe ferramenta de confirmação, edição ou exclusão.
 
 A documentação oficial é obtida de uma lista de URLs do adaptador, com redirects restritos, extração de texto e preservação da cópia anterior em falhas. Uma síntese local identificada como resumo fornece contexto básico antes da primeira atualização. A pesquisa Brave complementa a documentação e retorna fontes; ela depende de chave configurada.
 

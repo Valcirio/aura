@@ -2,21 +2,13 @@ use crate::{
     calendar::EventDraft,
     error::{AppError, Result},
     memory::{Memory, Message},
+    tools::{ActionField, Effect},
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-pub(crate) fn migrate(db: &mut Connection) -> rusqlite::Result<()> {
-    let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 1 {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    if version == 1 {
-        return Ok(());
-    }
-    let tx = db.transaction()?;
-    tx.execute_batch("ALTER TABLE sessions ADD COLUMN service_id TEXT;
+const V1: &str = "ALTER TABLE sessions ADD COLUMN service_id TEXT;
       ALTER TABLE sessions ADD COLUMN account_id TEXT;
       CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE connections(service_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, label TEXT NOT NULL);
@@ -37,8 +29,50 @@ pub(crate) fn migrate(db: &mut Connection) -> rusqlite::Result<()> {
         service_id TEXT NOT NULL, account_id TEXT NOT NULL, event TEXT NOT NULL, status TEXT NOT NULL,
         created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, result TEXT);
       CREATE INDEX operations_session ON operations(session_id,status);
-      PRAGMA user_version=1;")?;
-    tx.commit()
+      PRAGMA user_version=1;";
+
+pub(crate) fn migrate(db: &mut Connection) -> rusqlite::Result<()> {
+    let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > 2 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    if version < 1 {
+        let tx = db.transaction()?;
+        tx.execute_batch(V1)?;
+        tx.commit()?;
+    }
+    if version < 2 {
+        let tx = db.transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE operations ADD COLUMN tool TEXT NOT NULL DEFAULT 'calendar_create_event';
+      ALTER TABLE operations ADD COLUMN effect TEXT NOT NULL DEFAULT 'external_write';
+      ALTER TABLE operations ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+      ALTER TABLE operations ADD COLUMN fields TEXT NOT NULL DEFAULT '[]';",
+        )?;
+        let rows = {
+            let mut statement = tx.prepare("SELECT id,event FROM operations")?;
+            statement
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, event) in rows {
+            let (summary, fields) = match serde_json::from_str::<EventDraft>(&event) {
+                Ok(draft) => (draft.summary.clone(), draft.action_fields()),
+                Err(_) => ("Ação".into(), Vec::new()),
+            };
+            tx.execute(
+                "UPDATE operations SET summary=?1,fields=?2 WHERE id=?3",
+                params![
+                    summary,
+                    serde_json::to_string(&fields).unwrap_or_else(|_| "[]".into()),
+                    id
+                ],
+            )?;
+        }
+        tx.execute_batch("PRAGMA user_version=2;")?;
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,12 +89,35 @@ pub struct Document {
 pub struct Operation {
     pub id: String,
     pub session_id: Option<i64>,
-    pub service_id: String,
+    #[serde(alias = "service_id")]
+    pub integration: String,
     pub account_id: String,
-    pub event: EventDraft,
+    pub tool: String,
+    pub effect: Effect,
+    pub summary: String,
+    pub fields: Vec<ActionField>,
+    pub payload: Value,
     pub status: String,
     pub expires_at: i64,
     pub result: Option<Value>,
+}
+
+impl Operation {
+    pub fn payload_as<T: DeserializeOwned>(&self) -> Result<T> {
+        Ok(serde_json::from_value(self.payload.clone())?)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NewOperation<'a> {
+    pub session: i64,
+    pub integration: &'a str,
+    pub account: &'a str,
+    pub tool: &'a str,
+    pub effect: Effect,
+    pub summary: &'a str,
+    pub fields: &'a [ActionField],
+    pub payload: &'a Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,21 +245,32 @@ impl Memory {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
-    pub fn connection_info(&self) -> Result<Option<ConnectionInfo>> {
-        Ok(self.connection.query_row("SELECT service_id,account_id,label FROM connections WHERE service_id='google_calendar'",[],|r|Ok(ConnectionInfo{service_id:r.get(0)?,account_id:r.get(1)?,label:r.get(2)?})).optional()?)
+    pub fn connection_info(&self, integration: &str) -> Result<Option<ConnectionInfo>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT service_id,account_id,label FROM connections WHERE service_id=?1",
+                [integration],
+                |r| {
+                    Ok(ConnectionInfo {
+                        service_id: r.get(0)?,
+                        account_id: r.get(1)?,
+                        label: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
     }
-    pub fn save_connection(&self, account_id: &str, label: &str) -> Result<()> {
-        self.connection.execute("INSERT INTO connections VALUES('google_calendar',?1,?2) ON CONFLICT(service_id) DO UPDATE SET account_id=excluded.account_id,label=excluded.label",params![account_id,label])?;
+    pub fn save_connection(&self, integration: &str, account_id: &str, label: &str) -> Result<()> {
+        self.connection.execute("INSERT INTO connections VALUES(?1,?2,?3) ON CONFLICT(service_id) DO UPDATE SET account_id=excluded.account_id,label=excluded.label",params![integration,account_id,label])?;
         Ok(())
     }
-    pub fn remove_connection(&self) -> Result<()> {
+    pub fn remove_connection(&self, integration: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM connections WHERE service_id=?1", [integration])?;
         self.connection.execute(
-            "DELETE FROM connections WHERE service_id='google_calendar'",
-            [],
-        )?;
-        self.connection.execute(
-            "UPDATE operations SET status='cancelled' WHERE status='awaiting_confirmation'",
-            [],
+            "UPDATE operations SET status='cancelled' WHERE status='awaiting_confirmation' AND service_id=?1",
+            [integration],
         )?;
         Ok(())
     }
@@ -221,13 +289,13 @@ impl Memory {
             ON CONFLICT(service_id,url) DO UPDATE SET title=excluded.title,text=excluded.text,updated_at=excluded.updated_at",params![service,url,title,text,updated])?;
         Ok(())
     }
-    pub fn knowledge_search(&self, service: &str, query: &str) -> Result<Vec<Document>> {
+    pub fn knowledge_search(&self, service: Option<&str>, query: &str) -> Result<Vec<Document>> {
         let expression = fts(query);
         if expression.is_empty() {
             return Ok(Vec::new());
         }
         Ok(self.connection.prepare("SELECT d.id,d.service_id,d.url,d.title,snippet(documents_fts,0,'','', ' … ',48),d.updated_at
-            FROM documents_fts f JOIN documents d ON d.id=f.rowid WHERE documents_fts MATCH ?1 AND d.service_id=?2 ORDER BY rank LIMIT 6")?
+            FROM documents_fts f JOIN documents d ON d.id=f.rowid WHERE documents_fts MATCH ?1 AND (?2 IS NULL OR d.service_id=?2) ORDER BY rank LIMIT 6")?
             .query_map(params![expression,service],|r|Ok(Document{id:r.get(0)?,service_id:r.get(1)?,url:r.get(2)?,title:r.get(3)?,text:r.get(4)?,updated_at:r.get(5)?}))?.collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn document_count(&self, service: &str) -> Result<i64> {
@@ -237,35 +305,33 @@ impl Memory {
             |r| r.get(0),
         )?)
     }
-    pub fn prepare_operation(
-        &mut self,
-        session: i64,
-        account: &str,
-        event: &EventDraft,
-        now: i64,
-    ) -> Result<Operation> {
-        if !self.session_exists(session)? {
+    pub fn prepare_operation(&mut self, new: &NewOperation, now: i64) -> Result<Operation> {
+        if !self.session_exists(new.session)? {
             return Err(AppError::invalid("Sessão não encontrada"));
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
         let tx = self.connection.transaction()?;
-        tx.execute("UPDATE operations SET status='cancelled' WHERE session_id=?1 AND status='awaiting_confirmation'",[session])?;
-        tx.execute("INSERT INTO operations(id,session_id,service_id,account_id,event,status,created_at,expires_at) VALUES(?1,?2,'google_calendar',?3,?4,'awaiting_confirmation',?5,?6)",params![id,session,account,serde_json::to_string(event)?,now,now+600])?;
+        tx.execute("UPDATE operations SET status='cancelled' WHERE session_id=?1 AND status='awaiting_confirmation'",[new.session])?;
+        tx.execute("INSERT INTO operations(id,session_id,service_id,account_id,event,status,created_at,expires_at,tool,effect,summary,fields) VALUES(?1,?2,?3,?4,?5,'awaiting_confirmation',?6,?7,?8,?9,?10,?11)",params![id,new.session,new.integration,new.account,serde_json::to_string(new.payload)?,now,now+600,new.tool,serde_json::to_value(new.effect)?.as_str().unwrap_or_default(),new.summary,serde_json::to_string(new.fields)?])?;
         tx.commit()?;
         self.operation(&id)
     }
     pub fn operation(&self, id: &str) -> Result<Operation> {
-        let row=self.connection.query_row("SELECT id,session_id,service_id,account_id,event,status,expires_at,result FROM operations WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?,r.get::<_,Option<String>>(7)?))).optional()?
+        let row=self.connection.query_row("SELECT id,session_id,service_id,account_id,event,status,expires_at,result,tool,effect,summary,fields FROM operations WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?))).optional()?
             .ok_or_else(||AppError::new("ACTION_NOT_FOUND","Proposta não encontrada"))?;
         Ok(Operation {
             id: row.0,
             session_id: row.1,
-            service_id: row.2,
+            integration: row.2,
             account_id: row.3,
-            event: serde_json::from_str(&row.4)?,
+            payload: serde_json::from_str(&row.4)?,
             status: row.5,
             expires_at: row.6,
             result: row.7.map(|s| serde_json::from_str(&s)).transpose()?,
+            tool: row.8,
+            effect: serde_json::from_value(Value::String(row.9))?,
+            summary: row.10,
+            fields: serde_json::from_str(&row.11)?,
         })
     }
     pub fn pending_operation(&self, session: i64) -> Result<Option<Operation>> {
@@ -365,7 +431,8 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calendar::EventInput;
+    use crate::calendar::{EventInput, GOOGLE_CALENDAR};
+    use serde_json::json;
     fn draft() -> EventDraft {
         EventDraft::validate(EventInput {
             calendar_id: "primary".into(),
@@ -383,10 +450,10 @@ mod tests {
         let mut m = Memory::ephemeral().unwrap();
         let s = m.create_session("s").unwrap();
         let first = m
-            .prepare_operation(s.id, "account-a", &draft(), 100)
+            .prepare_calendar_event(s.id, "account-a", &draft(), 100)
             .unwrap();
         let second = m
-            .prepare_operation(s.id, "account-a", &draft(), 101)
+            .prepare_calendar_event(s.id, "account-a", &draft(), 101)
             .unwrap();
         assert!(
             m.claim_operation(&first.id, s.id, "account-a", 102)
@@ -409,7 +476,7 @@ mod tests {
     fn expired_proposal_cannot_be_confirmed() {
         let mut m = Memory::ephemeral().unwrap();
         let s = m.create_session("s").unwrap();
-        let op = m.prepare_operation(s.id, "a", &draft(), 100).unwrap();
+        let op = m.prepare_calendar_event(s.id, "a", &draft(), 100).unwrap();
         assert!(m.claim_operation(&op.id, s.id, "a", 701).is_err());
     }
     #[test]
@@ -424,16 +491,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            m.knowledge_search("google_calendar", "compromisso")
+            m.knowledge_search(Some("google_calendar"), "compromisso")
                 .unwrap()
                 .len(),
             1
         );
         assert!(
-            m.knowledge_search("other_service", "compromisso")
+            m.knowledge_search(Some("other_service"), "compromisso")
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(m.knowledge_search(None, "compromisso").unwrap().len(), 1);
         assert!(m.search("compromisso", None, 8).unwrap().is_empty());
         assert!(
             m.replace_document(
@@ -446,7 +514,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            m.knowledge_search("google_calendar", "compromisso")
+            m.knowledge_search(Some("google_calendar"), "compromisso")
                 .unwrap()
                 .len(),
             1
@@ -475,7 +543,7 @@ mod tests {
     fn crash_recovery_preserves_id_without_repeating_write() {
         let mut m = Memory::ephemeral().unwrap();
         let s = m.create_session("s").unwrap();
-        let op = m.prepare_operation(s.id, "a", &draft(), 100).unwrap();
+        let op = m.prepare_calendar_event(s.id, "a", &draft(), 100).unwrap();
         m.claim_operation(&op.id, s.id, "a", 101).unwrap();
         m.recover_operations().unwrap();
         assert_eq!(m.operation(&op.id).unwrap().status, "unknown");
@@ -508,5 +576,97 @@ mod tests {
             .search_history("", None, None, Some("2026-10-29T00:00:00-03:00"), None)
             .unwrap();
         assert!(excluded.is_empty());
+    }
+    #[test]
+    fn migrates_v1_operations_to_v2() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(include_str!("schema.sql"))
+            .unwrap();
+        connection.execute_batch(V1).unwrap();
+        let draft = draft();
+        let event = serde_json::to_string(&draft).unwrap();
+        connection
+            .execute(
+                "INSERT INTO operations(id,session_id,service_id,account_id,event,status,created_at,expires_at) VALUES('op1',NULL,'google_calendar','acc',?1,'awaiting_confirmation',1,2)",
+                [event.clone()],
+            )
+            .unwrap();
+        migrate(&mut connection).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let (tool, effect, summary, fields, stored): (String, String, String, String, String) =
+            connection
+                .query_row(
+                    "SELECT tool,effect,summary,fields,event FROM operations WHERE id='op1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+        assert_eq!(tool, "calendar_create_event");
+        assert_eq!(effect, "external_write");
+        assert_eq!(summary, "Reunião");
+        let fields: Vec<ActionField> = serde_json::from_str(&fields).unwrap();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0], ActionField::new("Agenda", "Principal"));
+        assert_eq!(stored, event);
+        migrate(&mut connection).unwrap();
+    }
+    #[test]
+    fn ephemeral_memory_uses_schema_v2() {
+        let m = Memory::ephemeral().unwrap();
+        let version: u32 = m
+            .connection
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+    #[test]
+    fn operations_are_generic_and_round_trip() {
+        let mut m = Memory::ephemeral().unwrap();
+        let s = m.create_session("s").unwrap();
+        let payload = json!({"k":1});
+        let op = m
+            .prepare_operation(
+                &NewOperation {
+                    session: s.id,
+                    integration: "x",
+                    account: "acc",
+                    tool: "t",
+                    effect: Effect::ExternalWrite,
+                    summary: "S",
+                    fields: &[ActionField::new("A", "b")],
+                    payload: &payload,
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(op.payload, json!({"k":1}));
+        assert_eq!(op.fields.len(), 1);
+        assert_eq!(op.payload_as::<Value>().unwrap(), json!({"k":1}));
+        let value = serde_json::to_value(&op).unwrap();
+        assert_eq!(value["effect"], "external_write");
+        assert_eq!(value["integration"], "x");
+        assert!(value.get("event").is_none());
+        let mut legacy = value.clone();
+        let integration = legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("integration")
+            .unwrap();
+        legacy["service_id"] = integration;
+        let parsed: Operation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.integration, "x");
+    }
+    #[test]
+    fn connections_are_scoped_per_integration() {
+        let m = Memory::ephemeral().unwrap();
+        m.save_connection("x", "acc", "L").unwrap();
+        assert!(m.connection_info(GOOGLE_CALENDAR).unwrap().is_none());
+        m.save_connection(GOOGLE_CALENDAR, "g", "G").unwrap();
+        m.remove_connection("x").unwrap();
+        assert!(m.connection_info(GOOGLE_CALENDAR).unwrap().is_some());
     }
 }

@@ -25,7 +25,7 @@ O projeto está na **integração e validação operacional do MVP Linux**. Os p
 
 | Escopo do plano | Implementação disponível | O que falta comprovar |
 | --- | --- | --- |
-| Fundação e frontend | Tauri 2, Leptos, dispatcher IPC e quatro páginas: Conversa, Memória, Serviços e Configurações | Build WASM, abertura da WebView, canais IPC, estados visuais e acessibilidade |
+| Fundação e frontend | Tauri 2, Leptos, dispatcher IPC e quatro páginas: Conversa, Memória, Integrações e Configurações | Build WASM, abertura da WebView, canais IPC, estados visuais e acessibilidade |
 | Áudio local | Captura/reprodução CPAL, resampler, Silero VAD, `LocalSpeech` nativo (sherpa-onnx) com Whisper `turbo`/`small` e Kokoro `pf_dora`, instalação por catálogo na UI | Conversa com microfone e reprodução física, parada ≤200 ms, latência |
 | Modelos locais e APIs | Adaptadores Ollama/API compatível, streaming, probe de capacidades e cancelamento | Probe e conversa com um modelo local e uma API configurados |
 | Agentes, serviços e memória | Coordenador de ferramentas, registro de serviços, SQLite/FTS, documentação oficial e Brave Search | Recuperação durante conversa real, atualização pela rede e pesquisa com credencial |
@@ -35,6 +35,19 @@ O projeto está na **integração e validação operacional do MVP Linux**. Os p
 (Histórico) A validação registrada em VALIDACAO.md aprovou **51 testes automatizados**, o smoke de nove comandos do backend, a compilação do runtime com CPAL e a verificação de tipos do frontend no host. Isso não comprova execução WASM, inferência neural ou operações reais no Google Calendar.
 
 Os bloqueios encontrados foram dependências ausentes no cache, DNS indisponível para downloads e restrições do sandbox ao Chromium. Não há medições de latência, qualidade de voz ou consumo dos motores. O detalhamento permanece em [VALIDACAO.md](VALIDACAO.md).
+
+## Refatoração para agente generalista — Fase A
+
+**Concluído:**
+
+- especificações de ferramentas com efeitos (`Effect`, `ToolSpec`) e validação de esquema dos argumentos;
+- registro de integrações (`memory`, `knowledge`, `web`, `google_calendar`) com ativação/desativação por `integrations_disabled`;
+- Operations v2 genéricas (`integration`, `tool`, `effect`, `summary`, `fields`);
+- um único loop de agente com limites e eventos `tool.started`/`tool.completed`;
+- commands `integration_*` (`service_*` como aliases obsoletos);
+- UI com texto genérico, página Integrações e atividade de ferramentas.
+
+**Próximo:** Fase B (tarefas, lembretes, notas), Fase C (arquivos/sistema), Fase D (UI) e, em seguida, Etapa 4 (remoção do Python).
 
 ## Próxima implementação prioritária
 

@@ -79,8 +79,16 @@ struct OpenSource {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Service {
-    service_id: String,
+struct IntegrationArg {
+    #[serde(alias = "service_id")]
+    integration: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetEnabled {
+    #[serde(alias = "service_id")]
+    integration: String,
+    enabled: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,9 +110,10 @@ struct Busy {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Prepare {
-    session_id: i64,
-    event: support_core::calendar::EventInput,
+struct KnowledgeSearch {
+    query: String,
+    #[serde(default)]
+    integration: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -200,20 +209,47 @@ pub async fn dispatch(
             runtime.finish_input();
             Ok(json!({"finished":true}))
         }
-        "service_list" => {
+        "integration_list" | "service_list" => {
             let _: Empty = decode(args)?;
-            encode(runtime.registry.list())
+            let settings = runtime.settings()?;
+            let list = runtime
+                .integrations
+                .list()
+                .iter()
+                .map(|i| {
+                    let mut value = serde_json::to_value(i.manifest())?;
+                    value["connected"] = json!(i.connected(&runtime.db)?);
+                    value["enabled"] =
+                        json!(!settings.integrations_disabled.contains(&i.manifest().id));
+                    value["connectable"] =
+                        json!(i.manifest().id == support_core::calendar::GOOGLE_CALENDAR);
+                    value["tools"] = json!(
+                        i.tools()
+                            .iter()
+                            .map(|t| json!({"name":t.name,"label":t.label,"effect":t.effect}))
+                            .collect::<Vec<_>>()
+                    );
+                    Ok(value)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Value::Array(list))
         }
-        "service_status" => {
+        "integration_status" | "service_status" => {
             let _: Empty = decode(args)?;
             let google = runtime.google.status()?;
             Ok(
                 json!({"google_calendar":google,"documents":database(&runtime.db)?.document_count("google_calendar")?}),
             )
         }
-        "service_connect" => {
-            let v: Service = decode(args)?;
-            runtime.registry.get(&v.service_id)?;
+        "integration_connect" | "service_connect" => {
+            let v: IntegrationArg = decode(args)?;
+            runtime.integrations.get(&v.integration)?;
+            if v.integration != support_core::calendar::GOOGLE_CALENDAR {
+                return Err(AppError::new(
+                    "SERVICE_NOT_CONNECTABLE",
+                    "Integração sem conexão externa",
+                ));
+            }
             let settings = runtime.settings()?;
             let secret = runtime
                 .vault
@@ -230,31 +266,53 @@ pub async fn dispatch(
                 .unwrap_or(false);
             Ok(json!({"authorization_url":ticket.authorization_url,"browser_opened":opened}))
         }
-        "service_disconnect" => {
-            let v: Service = decode(args)?;
-            runtime.registry.get(&v.service_id)?;
+        "integration_disconnect" | "service_disconnect" => {
+            let v: IntegrationArg = decode(args)?;
+            runtime.integrations.get(&v.integration)?;
+            if v.integration != support_core::calendar::GOOGLE_CALENDAR {
+                return Err(AppError::new(
+                    "SERVICE_NOT_CONNECTABLE",
+                    "Integração sem conexão externa",
+                ));
+            }
             runtime.cancel();
             let _guard = runtime.service_serial.lock().await;
             Ok(json!({"disconnected":true,"revoked":runtime.google.disconnect().await?}))
         }
+        "integration_set_enabled" => {
+            let v: SetEnabled = decode(args)?;
+            runtime.integrations.get(&v.integration)?;
+            let mut settings = runtime.settings()?;
+            settings
+                .integrations_disabled
+                .retain(|id| id != &v.integration);
+            if !v.enabled {
+                settings.integrations_disabled.push(v.integration.clone());
+            }
+            let disabled = settings.integrations_disabled.clone();
+            runtime.save_settings(settings, None, None, None).await?;
+            Ok(
+                json!({"integration":v.integration,"enabled":v.enabled,"integrations_disabled":disabled}),
+            )
+        }
         "knowledge_refresh" => {
-            let v: Service = decode(args)?;
+            let v: IntegrationArg = decode(args)?;
             encode(
                 crate::knowledge::refresh(
                     &runtime.http,
                     &runtime.db,
-                    &runtime.registry,
-                    &v.service_id,
+                    &runtime.integrations,
+                    &v.integration,
                 )
                 .await?,
             )
         }
         "knowledge_search" => {
-            let v: Search = decode(args)?;
+            let v: KnowledgeSearch = decode(args)?;
             if v.query.len() > 512 {
                 return Err(AppError::invalid("Consulta muito longa"));
             }
-            encode(database(&runtime.db)?.knowledge_search("google_calendar", &v.query)?)
+            encode(database(&runtime.db)?.knowledge_search(v.integration.as_deref(), &v.query)?)
         }
         "calendar_list" => {
             let _: Empty = decode(args)?;
@@ -279,23 +337,6 @@ pub async fn dispatch(
                 .google
                 .free_busy(&v.calendar_ids, &v.start, &v.end)
                 .await
-        }
-        "calendar_prepare_event" => {
-            let v: Prepare = decode(args)?;
-            let draft = support_core::calendar::EventDraft::validate(v.event)?;
-            let account = database(&runtime.db)?
-                .connection_info()?
-                .ok_or_else(|| AppError::new("AUTH_REQUIRED", "Conecte sua conta Google"))?
-                .account_id;
-            crate::google::ensure_writable(runtime.google.as_ref(), &draft.calendar_id).await?;
-            let busy = crate::google::busy_for(runtime.google.as_ref(), &draft).await?;
-            let op = database(&runtime.db)?.prepare_operation(
-                v.session_id,
-                &account,
-                &draft,
-                crate::now(),
-            )?;
-            encode(database(&runtime.db)?.operation_context(&op.id, &busy)?)
         }
         "action_get" => {
             let v: Session = decode(args)?;
@@ -518,5 +559,176 @@ mod tests {
             assert_eq!(played["played"], true);
         }
         assert_eq!(plays.load(Ordering::SeqCst), 4);
+    }
+    #[tokio::test]
+    async fn integration_list_reports_integrations_and_rejects_builtin_connect() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::new(
+            directory.path().into(),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        );
+        let runtime = Runtime::open(paths).unwrap();
+        let list = dispatch(runtime.clone(), "integration_list", json!({}), None)
+            .await
+            .unwrap();
+        let ids = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["memory", "knowledge", "web", "google_calendar"]);
+        for entry in list.as_array().unwrap() {
+            assert_eq!(
+                entry["connectable"],
+                entry["id"] == "google_calendar",
+                "connectable only for google_calendar: {entry}"
+            );
+        }
+        let google = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == "google_calendar")
+            .unwrap();
+        assert_eq!(google["connected"], false);
+        let memory = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == "memory")
+            .unwrap();
+        let tools = memory["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        for tool in tools {
+            assert!(!tool["label"].as_str().unwrap_or_default().is_empty());
+            assert!(!tool["effect"].as_str().unwrap_or_default().is_empty());
+        }
+        let error = dispatch(
+            runtime.clone(),
+            "integration_connect",
+            json!({"integration":"memory"}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "SERVICE_NOT_CONNECTABLE");
+        let error = dispatch(runtime, "calendar_prepare_event", json!({}), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "COMMAND_NOT_ALLOWED");
+    }
+    #[tokio::test]
+    async fn integration_set_enabled_toggles_tools_and_reports_disabled_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::new(
+            directory.path().into(),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        );
+        let runtime = Runtime::open(paths).unwrap();
+        let web_tool = dispatch(runtime.clone(), "integration_list", json!({}), None)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == "web")
+            .unwrap()["tools"][0]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let disabled = dispatch(
+            runtime.clone(),
+            "integration_set_enabled",
+            json!({"integration":"web","enabled":false}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled["integrations_disabled"], json!(["web"]));
+        assert!(
+            !runtime
+                .tools()
+                .unwrap()
+                .iter()
+                .any(|v| v["function"]["name"] == web_tool.as_str())
+        );
+        let list = dispatch(runtime.clone(), "integration_list", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["id"] == "web")
+                .unwrap()["enabled"],
+            false
+        );
+        let enabled = dispatch(
+            runtime.clone(),
+            "integration_set_enabled",
+            json!({"integration":"web","enabled":true}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(enabled["integrations_disabled"], json!([]));
+        assert!(
+            runtime
+                .tools()
+                .unwrap()
+                .iter()
+                .any(|v| v["function"]["name"] == web_tool.as_str())
+        );
+        assert!(
+            dispatch(
+                runtime,
+                "integration_set_enabled",
+                json!({"integration":"nope","enabled":false}),
+                None
+            )
+            .await
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn legacy_service_commands_keep_working() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::new(
+            directory.path().into(),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        );
+        let runtime = Runtime::open(paths).unwrap();
+        let list = dispatch(runtime.clone(), "service_list", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 4);
+        let error = dispatch(
+            runtime,
+            "service_connect",
+            json!({"service_id":"memory"}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "SERVICE_NOT_CONNECTABLE");
+    }
+    #[tokio::test]
+    async fn integration_status_matches_service_status_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::new(
+            directory.path().into(),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        );
+        let runtime = Runtime::open(paths).unwrap();
+        let status = dispatch(runtime.clone(), "integration_status", json!({}), None)
+            .await
+            .unwrap();
+        assert!(status.get("google_calendar").is_some());
+        assert!(status.get("documents").is_some());
+        let legacy = dispatch(runtime, "service_status", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(status, legacy);
     }
 }

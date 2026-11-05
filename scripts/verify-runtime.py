@@ -9,11 +9,11 @@ ROOT = Path(__file__).resolve().parent.parent
 BINARY = ROOT / "crates/support-runtime/target/debug/aura-runtime"
 REQUESTS = [
     ("settings_get", {}),
-    ("service_list", {}),
+    ("integration_list", {}),
     ("session_create", {"title": "Smoke Calendar"}),
     ("session_list", {}),
     ("knowledge_search", {"query": "compromisso"}),
-    ("service_status", {}),
+    ("integration_status", {}),
     ("model_status", {}),
     ("action_confirm", {"id": "inexistente", "session_id": 1}),
     ("arbitrary_shell", {}),
@@ -37,7 +37,10 @@ with tempfile.TemporaryDirectory(prefix="aura-smoke-") as data:
     assert responses[0]["result"]["service_id"] == "google_calendar"
     assert responses[0]["result"]["voice"] == "pf_dora"
     assert responses[0]["result"]["asr_model"] == "turbo"
-    assert responses[1]["result"][0]["id"] == "google_calendar"
+    integrations = {item["id"]: item for item in responses[1]["result"]}
+    assert {"memory", "knowledge", "web", "google_calendar"} <= set(integrations)
+    assert integrations["google_calendar"]["connectable"] is True
+    assert "calendar_create_event" in [tool["name"] for tool in integrations["google_calendar"]["tools"]]
     assert responses[2]["result"]["id"] == 1
     assert len(responses[3]["result"]) == 1
     assert responses[4]["result"][0]["url"].startswith("https://developers.google.com/workspace/calendar")
@@ -58,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix="aura-smoke-") as data:
     assert artifacts["kokoro-multi-lang-v1_0"]["kind"] == "tts"
     assert artifacts["kokoro-multi-lang-v1_0"]["voice"] == "pf_dora"
     assert all(artifacts[i]["voice"] is None for i in IDS[:3])
-    assert responses[7]["error"]["code"] == "AUTH_REQUIRED"
+    assert responses[7]["error"]["code"] == "ACTION_NOT_FOUND"
     assert responses[8]["error"]["code"] == "COMMAND_NOT_ALLOWED"
     for index in (9, 10, 11, 12):
         assert responses[index]["error"]["code"] == "INVALID_INPUT", responses[index]

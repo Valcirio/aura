@@ -31,15 +31,15 @@ A ponte Leptos encapsula essa chamada. O harness `aura-runtime` usa o mesmo disp
 | Memória | `memory_search` | `query`, `session_id?`; até 8 resultados |
 | Conversa | `conversation_start` | `session_id`, `text?`; sem texto inicia voz automática; channel obrigatório |
 | Conversa | `conversation_finish_input`, `conversation_cancel` | `{}` |
-| Serviços | `service_list`, `service_status` | `{}` |
-| Serviços | `service_connect`, `service_disconnect` | `service_id` |
-| Conhecimento | `knowledge_refresh` | `service_id` |
+| Integrações | `integration_list`, `integration_status` | `{}`; a lista retorna o manifesto mais `connected`, `enabled`, `connectable` e `tools` (`[{name,label,effect}]`) |
+| Integrações | `integration_connect`, `integration_disconnect` | `integration` (alias legado `service_id`); só `google_calendar` é conectável, as demais retornam `SERVICE_NOT_CONNECTABLE` |
+| Integrações | `integration_set_enabled` | `integration`, `enabled`; atualiza `settings.integrations_disabled` e devolve a lista resultante |
+| Conhecimento | `knowledge_refresh` | `integration` (alias legado `service_id`) |
 | Conhecimento | `knowledge_search` | `query` |
 | Fontes | `source_open` | `url`; HTTP/HTTPS sem credenciais, aberto no navegador do sistema |
 | Calendar | `calendar_list` | `{}` |
 | Calendar | `calendar_events` | `calendar_id`, `start`, `end`, `query?`, `page_token?` |
 | Calendar | `calendar_free_busy` | `calendar_ids`, `start`, `end` |
-| Proposta | `calendar_prepare_event` | `session_id`, `event` |
 | Operação | `action_get` | `session_id`; última operação, inclusive concluída |
 | Operação | `action_confirm`, `action_cancel`, `action_retry` | `id`, `session_id` |
 | Operação | `action_reconcile` | `id` |
@@ -48,6 +48,8 @@ A ponte Leptos encapsula essa chamada. O harness `aura-runtime` usa o mesmo disp
 | Áudio | `alert_notice` | `kind`: `provider`, `models`, `capture` ou `synthesis` |
 | Áudio | `model_install` | `id` do catálogo; channel opcional de progresso |
 | Áudio | `voice_preview` | `id` da voz instalada |
+
+`service_list`, `service_status`, `service_connect` e `service_disconnect` são aliases **obsoletos** dos handlers `integration_*`.
 
 Selecionar modelo é salvar a configuração e aprová-la em `provider_probe`; não há uma segunda seleção silenciosa. Os commands antigos de sessões, memória e `model_validate` continuam como aliases diretos Tauri para compatibilidade. `model_validate` continua sendo somente validação de flags; o aplicativo real usa o probe.
 
@@ -76,6 +78,10 @@ Campos de credencial ausentes ou `null` preservam o segredo. Uma string vazia fo
 
 Tipos emitidos: `run.started`, `state.changed`, `transcript.final`, `tool.started`, `tool.completed`, `sources`, `assistant.delta`, `audio.level`, `audio.error`, `action.changed`, `turn.completed`, `turn.cancelled`, `error`, `run.completed`, `model.progress`.
 
+`tool.started` tem payload `{"name","label","effect"}`: `effect` é `read`/`external_write`/… (snake_case de `Effect`), ou `null` quando a ferramenta é desconhecida. `tool.completed` tem payload `{"name","label","ok"}`. `assistant.delta` chega de todas as rodadas do turno, não só da resposta final.
+
+O loop do agente, por turno, faz no máximo 8 rodadas com ferramentas mais 1 rodada final sem ferramentas; no máximo 12 chamadas de ferramenta (acima disso, `TOOL_BUDGET`); e no máximo 1 ação proposta (uma segunda chamada que exige aprovação na mesma rodada resulta em `ACTION_AMBIGUOUS`). Depois que uma ação é proposta, a rodada seguinte não oferece ferramentas e apenas pede confirmação. Rodadas somente de leitura executam até 2 chamadas ao mesmo tempo; rodadas com escrita executam em sequência.
+
 `audio.level` contém `rms` e origem `input`/`output`; o backend já considera o clock de reprodução. A UI ignora gerações e épocas locais obsoletas. A conclusão de um turno espera o stream final e o esvaziamento da fila de áudio. Cancelamento de uma conversa não desfaz operações externas confirmadas.
 
 ## Eventos do Calendar e confirmação
@@ -94,15 +100,15 @@ Tipos emitidos: `run.started`, `state.changed`, `transcript.final`, `tool.starte
 
 Para eventos com horário, aceitam-se timestamps com offset ou horários civis resolvidos pelo fuso IANA. Horários ambíguos/inexistentes exigem esclarecimento. Para dia inteiro, `start` e `end` são datas ISO e `end` é exclusivo.
 
-A preparação retorna uma operação com ID, sessão, conta, proposta, estado, expiração e informações de disponibilidade. Nenhuma criação ocorre nessa etapa. Estados: `awaiting_confirmation`, `executing`, `completed`, `unknown`, `failed`, `cancelled`, `expired`.
+Uma operação (ação pendente) é genérica e tem os campos: `id`, `session_id`, `integration` (aceita o alias legado `service_id` na leitura), `account_id`, `tool`, `effect` (`read`|`local_write`|`external_write`|`destructive`|`system`), `summary`, `fields` (`[{label,value}]`, valores brutos; a UI formata), `payload` (JSON específico da integração; para `calendar_create_event` é o `EventDraft` acima), `status`, `expires_at` e `result` (no calendário, disponibilidade `{busy:[...]}`). Nenhuma criação ocorre nessa etapa. Estados: `awaiting_confirmation`, `executing`, `completed`, `unknown`, `failed`, `cancelled`, `expired`. O schema SQLite v2 adiciona as colunas `tool`, `effect`, `summary` e `fields`; a coluna antiga `event` guarda o payload.
 
 `action_confirm` faz claim atômico, verifica conta/sessão, revalida disponibilidade e cria no Google. Chamadas repetidas a uma operação concluída retornam seu resultado. Uma proposta substituída, expirada ou de outra conta não pode ser gravada. `action_retry` somente reabre uma operação desconhecida quando o mesmo evento não foi encontrado; não faz a gravação e exige nova confirmação.
 
-O LLM recebe apenas `calendar_prepare_event` e ferramentas de consulta. `action_confirm` pertence ao controle de UI/voz do aplicativo e não consta do catálogo de ferramentas do modelo.
+O LLM recebe apenas ferramentas de consulta e `calendar_create_event`, que só propõe; a execução exige confirmação do usuário. `action_confirm` pertence ao controle de UI/voz do aplicativo e não consta do catálogo de ferramentas do modelo.
 
 ## Ferramentas comuns e erros
 
-`memory_search` do agente aceita `query`, `since?`, `until?`. Uma query vazia é permitida quando há filtro temporal. `conversation_get` recebe sessão e cursor; `knowledge_search` recebe query para o serviço ativo. `web_search` recebe query pública e recência opcional `pd`, `pw`, `pm` ou `py`.
+`memory_search` do agente aceita `query`, `since?`, `until?`. Uma query vazia é permitida quando há filtro temporal. `conversation_get` recebe sessão e cursor; `knowledge_search` recebe query e `integration?` opcional; pesquisa todas as integrações por padrão. `web_search` recebe query pública e recência opcional `pd`, `pw`, `pm` ou `py`.
 
 Erros possuem `{code,message,retryable}`. Entre os códigos: `AUTH_REQUIRED`, `OAUTH_DENIED`, `OAUTH_TIMEOUT`, `MODEL_NOT_VERIFIED`, `MODEL_INCOMPATIBLE`, `STREAM_TRUNCATED`, `CONTEXT_LIMIT`, `ACTION_NOT_CONFIRMABLE`, `AVAILABILITY_CHANGED`, `DEVICE_UNAVAILABLE`, `AUDIO_DEPENDENCIES`, `MODEL_NOT_INSTALLED`, `CANCELLED` e `COMMAND_NOT_ALLOWED`.
 
