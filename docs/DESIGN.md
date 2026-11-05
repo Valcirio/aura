@@ -16,7 +16,7 @@ O estado funcional é mantido em signals Leptos. A ponte JS não controla mensag
 | Estado | Feedback |
 |---|---|
 | Preparando | Aguarda aquecimento dos motores e abertura do dispositivo |
-| Ouvindo | Texto explícito, círculo ligado ao nível de entrada e botão Concluir fala |
+| Ouvindo | Texto explícito, medidor de RMS da entrada com rótulo e valor numérico acessível, círculo decorativo e botão Concluir fala |
 | Transcrevendo | Indica transformação da fala em texto |
 | Pensando | Arco discreto e descrição de processamento |
 | Documentação / Memória / Web | Identifica de onde o agente está buscando contexto |

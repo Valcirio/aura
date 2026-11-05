@@ -533,4 +533,110 @@ mod tests {
         assert!(fitted.iter().any(|m| m["tool_call_id"] == "call-a"));
         assert!(serde_json::to_string(&fitted).unwrap().chars().count() < 16000);
     }
+
+    #[test]
+    fn context_budget_keeps_latest_user_whole_and_removes_oldest_history_first() {
+        let latest = format!("atual-{} fim", "á".repeat(4500));
+        let messages = vec![
+            json!({"role":"system","content":"Política"}),
+            json!({"role":"user","content":format!("antigo-0 {}", "x".repeat(6000))}),
+            json!({"role":"assistant","content":format!("resposta-0 {}", "y".repeat(6000))}),
+            json!({"role":"user","content":format!("recente-1 {}", "z".repeat(6000))}),
+            json!({"role":"user","content":latest}),
+        ];
+        let fitted = fit_context(&messages, &[], 8192).unwrap();
+        let users: Vec<_> = fitted.iter().filter(|m| m["role"] == "user").collect();
+        assert_eq!(users.last().unwrap()["content"], latest);
+        assert_eq!(
+            fitted
+                .iter()
+                .filter(|m| m["role"] == "user" && m["content"] == latest.as_str())
+                .count(),
+            1
+        );
+        assert!(!fitted.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("antigo-0"))
+        }));
+        let contents: Vec<_> = fitted
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .filter(|c| c.starts_with("resposta-0") || c.starts_with("recente-1"))
+            .collect();
+        assert_eq!(contents.len(), 1);
+        assert!(contents[0].starts_with("recente-1"));
+    }
+
+    #[test]
+    fn context_budget_removes_history_before_shortening_tool_results() {
+        let evidence = "resultado ".repeat(1000);
+        let messages = vec![
+            json!({"role":"system","content":"Política"}),
+            json!({"role":"user","content":format!("antigo {}", "x".repeat(6000))}),
+            json!({"role":"assistant","tool_calls":[{"id":"call-a","function":{"name":"memory_search","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"call-a","name":"memory_search","content":evidence}),
+            json!({"role":"user","content":"Pedido atual"}),
+        ];
+        let fitted = fit_context(&messages, &[], 8192).unwrap();
+        assert!(!fitted.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("antigo"))
+        }));
+        let tools: Vec<_> = fitted
+            .iter()
+            .filter(|m| !m["tool_calls"].is_null() || m["role"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["tool_calls"][0]["id"], "call-a");
+        assert_eq!(tools[1]["tool_call_id"], "call-a");
+        assert_eq!(tools[1]["content"], evidence);
+    }
+
+    #[test]
+    fn context_budget_shortens_multibyte_tool_results_and_keeps_pairs() {
+        let evidence = "结果".repeat(10000);
+        let messages = vec![
+            json!({"role":"system","content":"Política"}),
+            json!({"role":"user","content":"Pedido atual"}),
+            json!({"role":"assistant","tool_calls":[{"id":"call-a","function":{"name":"memory_search","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"call-a","name":"memory_search","content":evidence}),
+        ];
+        let fitted = fit_context(&messages, &[], 8192).unwrap();
+        assert_eq!(fitted[1]["content"], "Pedido atual");
+        let assistant = fitted
+            .iter()
+            .find(|m| !m["tool_calls"].is_null())
+            .expect("assistant com tool_calls");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-a");
+        let tool = fitted
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("resultado de ferramenta");
+        assert_eq!(tool["tool_call_id"], "call-a");
+        let content = tool["content"].as_str().unwrap();
+        assert!(content.contains("[resultado reduzido por limite de contexto]"));
+        assert!(content.contains("结果"));
+        assert!(content.chars().count() < evidence.chars().count());
+    }
+
+    #[test]
+    fn context_budget_rejects_when_only_mandatory_messages_remain() {
+        let tools = vec![
+            json!({"type":"function","function":{"name":"x","description":"d".repeat(40000)}}),
+        ];
+        let messages = vec![
+            json!({"role":"system","content":"Política"}),
+            json!({"role":"user","content":"x".repeat(30000)}),
+        ];
+        let error = fit_context(&messages, &tools, 8192).unwrap_err();
+        assert_eq!(error.code, "CONTEXT_LIMIT");
+        let huge_user = vec![
+            json!({"role":"system","content":"Política"}),
+            json!({"role":"user","content":"á".repeat(20000)}),
+        ];
+        let error = fit_context(&huge_user, &[], 8192).unwrap_err();
+        assert_eq!(error.code, "CONTEXT_LIMIT");
+    }
 }

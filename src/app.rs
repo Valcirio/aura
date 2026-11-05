@@ -98,6 +98,10 @@ struct Ui {
     devices_known: RwSignal<bool>,
     voice_attempted: RwSignal<bool>,
     notices: RwSignal<NoticeGate>,
+    persisted_input: RwSignal<String>,
+    saving: RwSignal<bool>,
+    input_level: RwSignal<f64>,
+    input_feedback: RwSignal<String>,
 }
 impl Ui {
     fn new() -> Self {
@@ -142,6 +146,10 @@ impl Ui {
             devices_known: RwSignal::new(false),
             voice_attempted: RwSignal::new(false),
             notices: RwSignal::new(NoticeGate::default()),
+            persisted_input: RwSignal::new(String::new()),
+            saving: RwSignal::new(false),
+            input_level: RwSignal::new(0.),
+            input_feedback: RwSignal::new(String::new()),
         }
     }
     fn task(self, future: impl std::future::Future<Output = Result<(), String>> + 'static) {
@@ -255,6 +263,8 @@ impl Ui {
             &self.speech.get(),
             known.then_some(devices.as_slice()),
             &text(&self.settings.get(), "input_device"),
+            &self.persisted_input.get(),
+            self.saving.get(),
         )
     }
     /// Plays an embedded native notice. A failure here is only displayed: it never
@@ -270,22 +280,21 @@ impl Ui {
         });
     }
     /// A blocked voice attempt or help request: shows the blocker and, unless a notice is
-    /// already playing, announces it once.
     fn announce_blocker(self, blocker: VoiceBlocker) {
         self.voice_attempted.set(true);
         let mut allowed = false;
         self.notices.update(|gate| allowed = gate.allow_blocked());
-        if allowed {
-            self.play_notice(blocker.notice());
+        if let (Some(notice), true) = (blocker.notice(), allowed) {
+            self.play_notice(notice);
         }
     }
-    /// Voice start entry point: gated on provider, speech and input-device readiness.
     fn voice_start(self) {
         if let Some(blocker) = self.voice_blocker() {
             self.announce_blocker(blocker);
             return;
         }
         self.voice_attempted.set(false);
+        self.input_feedback.set(String::new());
         self.task(async move { self.start(None).await });
     }
     /// Retries whatever is blocking voice, without playing a notice.
@@ -301,9 +310,10 @@ impl Ui {
                     self.start_speech();
                 }
             }
-            VoiceBlocker::Input => {
+            VoiceBlocker::Input | VoiceBlocker::InvalidInput => {
                 wasm_bindgen_futures::spawn_local(async move { self.refresh_devices().await });
             }
+            VoiceBlocker::UnsavedInput | VoiceBlocker::SavingInput => {}
         }
     }
     /// Structured failures that deserve a spoken notice, at most once per failure per attempt.
@@ -347,7 +357,15 @@ impl Ui {
     }
     async fn save(self) -> Result<(), String> {
         let optional = |s: String| if s.is_empty() { Value::Null } else { json!(s) };
-        let result=request("settings_save",json!({"settings":self.settings.get_untracked(),"provider_key":optional(self.provider_key.get_untracked()),"brave_key":optional(self.brave_key.get_untracked()),"google_secret":optional(self.google_secret.get_untracked())})).await?;
+        let settings = self.settings.get_untracked();
+        let submitted_input = text(&settings, "input_device");
+        self.saving.set(true);
+        let result=request("settings_save",json!({"settings":settings,"provider_key":optional(self.provider_key.get_untracked()),"brave_key":optional(self.brave_key.get_untracked()),"google_secret":optional(self.google_secret.get_untracked())})).await;
+        self.saving.set(false);
+        let result = result?;
+        self.persisted_input.update(|persisted| {
+            *persisted = persisted_after_save(persisted, &submitted_input, true)
+        });
         self.provider_key.set(String::new());
         self.brave_key.set(String::new());
         self.google_secret.set(String::new());
@@ -392,6 +410,7 @@ impl Ui {
         }
         self.running.set(false);
         self.state.set("idle".into());
+        self.input_level.set(0.);
         orb_level(0.);
         if session > 0 {
             if let Ok(operation) = request("action_get", json!({"session_id":session})).await {
@@ -406,6 +425,7 @@ impl Ui {
     }
     /// Takes the active conversation stream, if any, and releases its bridge channel.
     fn dispose_active(self) {
+        self.input_level.set(0.);
         if let Some(stream) = self.active_stream.get_untracked() {
             self.active_stream.set(None);
             dispose_stream_js(stream);
@@ -447,6 +467,7 @@ impl Ui {
             self.active_stream.set(None);
             self.running.set(false);
             self.state.set("idle".into());
+            self.input_level.set(0.);
         }
         owned
     }
@@ -531,9 +552,32 @@ impl Ui {
         let payload = &event["payload"];
         let turn = text(&event, "turn_id");
         match event["kind"].as_str().unwrap_or("") {
-            "state.changed" => self.state.set(text(payload, "state")),
-            "audio.level" => orb_level(payload["rms"].as_f64().unwrap_or(0.)),
+            "state.changed" => {
+                let state = text(payload, "state");
+                self.state.set(state.clone());
+                if state != "listening" {
+                    self.input_level.set(0.);
+                }
+            }
+            "audio.level" => {
+                orb_level(payload["rms"].as_f64().unwrap_or(0.));
+                if let Some(rms) = meter_rms(
+                    &text(payload, "source"),
+                    &self.state.get_untracked(),
+                    payload["rms"].as_f64(),
+                ) {
+                    self.input_level.set(rms);
+                }
+            }
+            "input.feedback" => {
+                self.input_feedback.set(
+                    input_feedback_message(&text(payload, "reason"))
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
             "transcript.final" => {
+                self.input_feedback.set(String::new());
                 let id = format!("{turn}:user");
                 self.messages.update(|messages| {
                     messages.push(ChatLine {
@@ -584,10 +628,12 @@ impl Ui {
             "turn.cancelled" => {
                 self.running.set(false);
                 self.state.set("idle".into());
+                self.input_level.set(0.);
                 orb_level(0.);
             }
             "run.completed" => {
                 self.running.set(false);
+                self.input_level.set(0.);
                 orb_level(0.);
                 if self.state.get_untracked() != "error" {
                     self.state.set(
@@ -605,6 +651,7 @@ impl Ui {
     }
     async fn start(self, message: Option<String>) -> Result<(), String> {
         self.notices.update(|gate| gate.new_attempt());
+        self.input_level.set(0.);
         if message.is_some() && self.provider_state.get_untracked() != "ready" {
             return Err(
                 "O modelo ainda não foi validado. Aguarde a verificação ou tente novamente.".into(),
@@ -756,15 +803,18 @@ fn check_outcome(
 enum VoiceBlocker {
     Provider,
     Models,
+    UnsavedInput,
+    SavingInput,
+    InvalidInput,
     Input,
 }
 impl VoiceBlocker {
-    /// Fixed native notice (`NoticeKind`) matching this blocker.
-    fn notice(self) -> &'static str {
+    fn notice(self) -> Option<&'static str> {
         match self {
-            Self::Provider => "provider",
-            Self::Models => "models",
-            Self::Input => "capture",
+            Self::Provider => Some("provider"),
+            Self::Models => Some("models"),
+            Self::Input | Self::InvalidInput => Some("capture"),
+            Self::UnsavedInput | Self::SavingInput => None,
         }
     }
     fn message(self, speech: &Value) -> String {
@@ -782,18 +832,56 @@ impl VoiceBlocker {
                 };
                 format!("Os modelos de fala (reconhecimento, detecção de voz e síntese) ainda não estão prontos.{hint}")
             }
+            Self::UnsavedInput => "A seleção de microfone tem alterações que ainda não foram salvas. Salve as configurações para iniciar a conversa por voz. A conversa por texto continua disponível.".into(),
+            Self::SavingInput => "A seleção de microfone está sendo salva. Aguarde a confirmação para iniciar a conversa por voz. A conversa por texto continua disponível.".into(),
+            Self::InvalidInput => "O microfone salvo não está disponível ou usa uma identificação anterior. Selecione novamente o dispositivo de entrada em Configurações e salve. A conversa por texto continua disponível.".into(),
             Self::Input => "Nenhum microfone disponível. Conecte um dispositivo de entrada ou escolha outro em Configurações e tente novamente.".into(),
         }
     }
 }
 
-/// Voice needs the provider, the combined speech readiness and (when the device list is
-/// known) an available input device. Unknown device availability never blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputSelection {
+    Saved,
+    Saving,
+    Unsaved,
+}
+
+fn input_selection(draft: &str, persisted: &str, saving: bool) -> InputSelection {
+    if saving {
+        InputSelection::Saving
+    } else if draft != persisted {
+        InputSelection::Unsaved
+    } else {
+        InputSelection::Saved
+    }
+}
+
+fn input_selection_message(selection: InputSelection) -> &'static str {
+    match selection {
+        InputSelection::Saved => "",
+        InputSelection::Saving => "Salvando a seleção de microfone…",
+        InputSelection::Unsaved => {
+            "Seleção de microfone não salva. Salve as configurações para usar a voz."
+        }
+    }
+}
+
+fn persisted_after_save(previous: &str, submitted: &str, succeeded: bool) -> String {
+    if succeeded {
+        submitted.to_string()
+    } else {
+        previous.to_string()
+    }
+}
+
 fn voice_blocker(
     provider_state: &str,
     speech: &Value,
     devices: Option<&[Value]>,
-    input_device: &str,
+    draft_input: &str,
+    persisted_input: &str,
+    saving: bool,
 ) -> Option<VoiceBlocker> {
     if provider_state != "ready" {
         return Some(VoiceBlocker::Provider);
@@ -801,14 +889,20 @@ fn voice_blocker(
     if speech["ready"] != true {
         return Some(VoiceBlocker::Models);
     }
+    match input_selection(draft_input, persisted_input, saving) {
+        InputSelection::Saving => return Some(VoiceBlocker::SavingInput),
+        InputSelection::Unsaved => return Some(VoiceBlocker::UnsavedInput),
+        InputSelection::Saved => {}
+    }
     let inputs = devices?
         .iter()
         .filter(|device| device["direction"] == "input")
         .collect::<Vec<_>>();
-    if inputs.is_empty()
-        || (!input_device.is_empty() && !inputs.iter().any(|device| device["id"] == input_device))
-    {
+    if inputs.is_empty() {
         return Some(VoiceBlocker::Input);
+    }
+    if !persisted_input.is_empty() && !inputs.iter().any(|device| device["id"] == persisted_input) {
+        return Some(VoiceBlocker::InvalidInput);
     }
     None
 }
@@ -836,10 +930,11 @@ impl NoticeGate {
     }
 }
 
-/// Spoken notice for a structured failure event; playback failures are only displayed.
 fn notice_for_event(kind: &str, payload: &Value) -> Option<&'static str> {
     match kind {
-        "audio.error" if payload["stage"] == "synthesis" => Some("synthesis"),
+        "audio.error" if payload["stage"] == "synthesis" && payload["partial"] != true => {
+            Some("synthesis")
+        }
         "error"
             if [
                 "DEVICE_UNAVAILABLE",
@@ -857,7 +952,10 @@ fn notice_for_event(kind: &str, payload: &Value) -> Option<&'static str> {
 
 fn audio_event_message(kind: &str, payload: &Value) -> String {
     let message = text(payload, "message");
-    if kind == "audio.error" && payload["stage"] == "playback" {
+    if kind == "audio.error" && payload["stage"] == "synthesis" && payload["partial"] == true {
+        "Parte da resposta não pôde ser falada. A resposta completa continua visível por escrito."
+            .into()
+    } else if kind == "audio.error" && payload["stage"] == "playback" {
         format!(
             "{message} Verifique o dispositivo de saída em Configurações. A resposta continua visível por escrito."
         )
@@ -875,6 +973,39 @@ fn notice_output_failure(error: &str) -> String {
 fn audio_failure(error: &str) -> String {
     format!(
         "Não foi possível listar os dispositivos de áudio: {error} A conversa por texto continua disponível."
+    )
+}
+
+fn saved_input_label(devices: &[Value], persisted: &str) -> String {
+    if persisted.is_empty() {
+        return "Padrão do sistema".into();
+    }
+    devices
+        .iter()
+        .find(|device| device["direction"] == "input" && text(device, "id") == persisted)
+        .map(|device| text(device, "name"))
+        .unwrap_or_else(|| "indisponível — selecione novamente".into())
+}
+
+fn input_feedback_message(reason: &str) -> Option<&'static str> {
+    match reason {
+        "empty_speech" => Some("Nenhuma fala detectada. Tente falar novamente."),
+        "empty_transcript" => {
+            Some("Não foi possível reconhecer palavras no áudio. Tente novamente.")
+        }
+        _ => None,
+    }
+}
+
+fn meter_rms(source: &str, state: &str, value: Option<f64>) -> Option<f64> {
+    if source != "input" || state != "listening" {
+        return None;
+    }
+    Some(
+        value
+            .filter(|rms| rms.is_finite())
+            .unwrap_or(0.)
+            .clamp(0., 1.),
     )
 }
 
@@ -1006,7 +1137,9 @@ pub fn App() -> impl IntoView {
             return;
         }
         ui.task(async move {
-            ui.settings.set(request("settings_get", json!({})).await?);
+            let settings = request("settings_get", json!({})).await?;
+            ui.persisted_input.set(text(&settings, "input_device"));
+            ui.settings.set(settings);
             ui.start_speech();
             ui.start_check();
             ui.refresh_sessions().await?;
@@ -1081,6 +1214,11 @@ fn Conversation(ui: Ui) -> impl IntoView {
                 <button class="text-button" on:click=move |_|if let Some(blocker)=ui.voice_blocker(){ui.retry_blocker(blocker)}>"Tentar novamente"</button>
                 <button class="text-button" on:click=move |_|if let Some(blocker)=ui.voice_blocker(){ui.announce_blocker(blocker)}>"Ouvir orientação"</button></div></Show>
             <p class="fine-print">"O microfone é aberto apenas ao começar. O áudio bruto não é salvo."</p>
+            <div class="input-meter"><label for="input-level">"Nível do microfone"</label>
+                <meter id="input-level" min="0" max="1" tabindex="0" prop:value=move||ui.input_level.get()
+                    aria-valuetext=move||format!("{:.0}% do nível máximo",ui.input_level.get()*100.)></meter>
+                <span class="input-meter-value" aria-hidden="true">{move||format!("{:.0}%",ui.input_level.get()*100.)}</span></div>
+            <Show when=move||!ui.input_feedback.get().is_empty()><p class="input-feedback" role="status" aria-live="polite">{move||ui.input_feedback.get()}</p></Show>
         </div>
         <div class="configuration-row"><button class="config-card" on:click=move |_|ui.page.set("settings")><span class="config-icon">"✧"</span><span class="config-copy"><small>"Modelo de suporte"</small><strong>{move||text(&ui.settings.get()["provider"],"model")}</strong></span><span>"↗"</span></button>
             <div class="config-card"><span class="config-icon">"≋"</span><div class="config-copy"><label for="active-voice">"Voz da resposta"</label><select id="active-voice" disabled=move||ui.running.get()||!settings_loaded(ui) on:change=move|ev|{ui.set("voice",json!(event_target_value(&ev)));ui.task(async move{ui.save().await});}>{move||choice_options(ui,"voice")}</select></div></div></div>
@@ -1314,7 +1452,29 @@ fn DeviceSelect(ui: Ui, direction: &'static str, label: &'static str) -> impl In
         "output_device"
     };
     view! {<label class="field">{label}<select prop:value=move||text(&ui.settings.get(),key) on:change=move|ev|{let value=event_target_value(&ev);ui.set(key,if value.is_empty(){Value::Null}else{json!(value)});}>
-    <option value="">"Padrão do sistema"</option>{move||ui.devices.get().into_iter().filter(|d|d["direction"]==direction).map(|device|view!{<option value=text(&device,"id")>{text(&device,"name")}</option>}).collect_view()}</select></label>}
+    <option value="">"Padrão do sistema"</option>{move||device_options(ui.devices.get(),direction,&text(&ui.settings.get(),key))}</select></label>
+    <Show when=move||direction=="input"><p class="saved-input">{move||format!("Microfone salvo: {}",saved_input_label(&ui.devices.get(),&ui.persisted_input.get()))}</p>
+        <Show when=move||input_selection(&text(&ui.settings.get(),"input_device"),&ui.persisted_input.get(),ui.saving.get())!=InputSelection::Saved>
+            <p class="unsaved-input" role="status">{move||input_selection_message(input_selection(&text(&ui.settings.get(),"input_device"),&ui.persisted_input.get(),ui.saving.get()))}</p></Show></Show>}
+}
+
+fn device_options(
+    devices: Vec<Value>,
+    direction: &'static str,
+    current: &str,
+) -> impl IntoView + use<> {
+    let listed = devices
+        .into_iter()
+        .filter(|device| device["direction"] == direction)
+        .collect::<Vec<_>>();
+    let missing = !current.is_empty() && !listed.iter().any(|device| text(device, "id") == current);
+    let unavailable = missing.then(|| {
+        view! {<option value=current.to_string() selected=true>"indisponível — selecione novamente"</option>}
+    });
+    view! {
+        {unavailable}
+        {listed.into_iter().map(|device|{let id=text(&device,"id");let selected=id==current;view!{<option value=id selected=selected>{text(&device,"name")}</option>}}).collect_view()}
+    }
 }
 
 #[cfg(test)]
@@ -1624,7 +1784,14 @@ mod tests {
     fn voice_start_is_gated_in_order_and_text_stays_independent() {
         let devices = vec![mic("input:0")];
         assert_eq!(
-            voice_blocker("unavailable", &ready_speech(), Some(&devices), ""),
+            voice_blocker(
+                "unavailable",
+                &ready_speech(),
+                Some(&devices),
+                "",
+                "",
+                false
+            ),
             Some(VoiceBlocker::Provider)
         );
         assert_eq!(
@@ -1632,34 +1799,50 @@ mod tests {
                 "ready",
                 &json!({"phase":"downloading","active":true}),
                 Some(&devices),
-                ""
+                "",
+                "",
+                false
             ),
             Some(VoiceBlocker::Models)
         );
         assert_eq!(
-            voice_blocker("ready", &ready_speech(), Some(&devices), ""),
+            voice_blocker("ready", &ready_speech(), Some(&devices), "", "", false),
             None
         );
         assert_eq!(
-            voice_blocker("ready", &ready_speech(), Some(&[]), ""),
+            voice_blocker("ready", &ready_speech(), Some(&[]), "", "", false),
             Some(VoiceBlocker::Input)
         );
         let outputs = vec![json!({"id":"output:0","direction":"output"})];
         assert_eq!(
-            voice_blocker("ready", &ready_speech(), Some(&outputs), ""),
+            voice_blocker("ready", &ready_speech(), Some(&outputs), "", "", false),
             Some(VoiceBlocker::Input)
         );
         assert_eq!(
-            voice_blocker("ready", &ready_speech(), Some(&devices), "input:7"),
-            Some(VoiceBlocker::Input)
+            voice_blocker(
+                "ready",
+                &ready_speech(),
+                Some(&devices),
+                "input:7",
+                "input:7",
+                false
+            ),
+            Some(VoiceBlocker::InvalidInput)
         );
         assert_eq!(
-            voice_blocker("ready", &ready_speech(), Some(&devices), "input:0"),
+            voice_blocker(
+                "ready",
+                &ready_speech(),
+                Some(&devices),
+                "input:0",
+                "input:0",
+                false
+            ),
             None
         );
         // Unknown device availability never blocks.
         assert_eq!(
-            voice_blocker("ready", &ready_speech(), None, "input:7"),
+            voice_blocker("ready", &ready_speech(), None, "input:7", "input:7", false),
             None
         );
         // Text operation only looks at the provider.
@@ -1668,6 +1851,207 @@ mod tests {
         ui.speech.set(json!({"phase":"failed","ready":false}));
         assert_eq!(ui.voice_blocker(), Some(VoiceBlocker::Models));
         assert_eq!(ui.provider_state.get_untracked(), "ready");
+    }
+
+    #[test]
+    fn voice_start_waits_for_the_saved_input_not_the_draft() {
+        let devices = vec![mic("input:0"), mic("input:1")];
+        assert_eq!(
+            voice_blocker(
+                "ready",
+                &ready_speech(),
+                Some(&devices),
+                "input:1",
+                "input:0",
+                false
+            ),
+            Some(VoiceBlocker::UnsavedInput)
+        );
+        assert_eq!(
+            voice_blocker(
+                "ready",
+                &ready_speech(),
+                Some(&devices),
+                "input:0",
+                "input:0",
+                true
+            ),
+            Some(VoiceBlocker::SavingInput)
+        );
+        assert_eq!(
+            input_selection("input:1", "input:0", false),
+            InputSelection::Unsaved
+        );
+        assert_eq!(
+            input_selection("input:0", "input:0", true),
+            InputSelection::Saving
+        );
+        assert_eq!(
+            input_selection("input:0", "input:0", false),
+            InputSelection::Saved
+        );
+        assert!(input_selection_message(InputSelection::Unsaved).contains("não salva"));
+        assert!(input_selection_message(InputSelection::Saving).contains("Salvando"));
+        assert!(input_selection_message(InputSelection::Saved).is_empty());
+    }
+
+    #[test]
+    fn saved_identity_changes_only_after_a_successful_save() {
+        assert_eq!(persisted_after_save("input:0", "input:1", true), "input:1");
+        assert_eq!(persisted_after_save("input:0", "input:1", false), "input:0");
+        assert_eq!(persisted_after_save("", "", true), "");
+        let persisted = persisted_after_save("input:0", "input:1", false);
+        assert_eq!(
+            voice_blocker(
+                "ready",
+                &ready_speech(),
+                Some(&[mic("input:0"), mic("input:1")]),
+                "input:1",
+                &persisted,
+                false
+            ),
+            Some(VoiceBlocker::UnsavedInput)
+        );
+    }
+
+    #[test]
+    fn missing_and_legacy_selections_are_shown_as_unavailable_not_default() {
+        let devices = vec![
+            json!({"id":"v1:[\"input\",\"Fone\"]","name":"Fone","direction":"input"}),
+            json!({"id":"v1:[\"output\",\"Caixa\"]","name":"Caixa","direction":"output"}),
+        ];
+        assert_eq!(saved_input_label(&devices, ""), "Padrão do sistema");
+        assert_eq!(
+            saved_input_label(&devices, "v1:[\"input\",\"Fone\"]"),
+            "Fone"
+        );
+        assert_eq!(
+            saved_input_label(&devices, "input:0"),
+            "indisponível — selecione novamente"
+        );
+        assert_eq!(
+            saved_input_label(&devices, "v1:[\"input\",\"Sumiu\"]"),
+            "indisponível — selecione novamente"
+        );
+        assert_eq!(
+            voice_blocker(
+                "ready",
+                &ready_speech(),
+                Some(&devices),
+                "input:0",
+                "input:0",
+                false
+            ),
+            Some(VoiceBlocker::InvalidInput)
+        );
+        let message = VoiceBlocker::InvalidInput.message(&json!({}));
+        assert!(message.contains("Selecione novamente") && !message.contains("Nenhum microfone"));
+    }
+
+    #[test]
+    fn input_meter_follows_only_listening_input_levels() {
+        assert_eq!(meter_rms("input", "listening", Some(0.42)), Some(0.42));
+        assert_eq!(meter_rms("output", "listening", Some(0.9)), None);
+        assert_eq!(meter_rms("input", "preparing", Some(0.9)), None);
+        assert_eq!(meter_rms("input", "speaking", Some(0.9)), None);
+        assert_eq!(meter_rms("input", "listening", Some(1.7)), Some(1.));
+        assert_eq!(meter_rms("input", "listening", Some(-0.3)), Some(0.));
+        assert_eq!(meter_rms("input", "listening", Some(f64::NAN)), Some(0.));
+        assert_eq!(
+            meter_rms("input", "listening", Some(f64::INFINITY)),
+            Some(0.)
+        );
+        assert_eq!(meter_rms("input", "listening", None), Some(0.));
+    }
+
+    #[test]
+    fn input_feedback_is_text_only_and_clears_as_documented() {
+        assert_eq!(
+            input_feedback_message("empty_speech"),
+            Some("Nenhuma fala detectada. Tente falar novamente.")
+        );
+        assert_eq!(
+            input_feedback_message("empty_transcript"),
+            Some("Não foi possível reconhecer palavras no áudio. Tente novamente.")
+        );
+        assert_eq!(input_feedback_message("other"), None);
+        for reason in ["empty_speech", "empty_transcript"] {
+            assert_eq!(
+                notice_for_event("input.feedback", &json!({"reason":reason})),
+                None
+            );
+        }
+        let ui = Ui::new();
+        ui.input_feedback.set("Nenhuma fala detectada.".into());
+        ui.event(
+            json!({"kind":"input.feedback","session_id":0,"generation":0,
+            "payload":{"reason":"empty_transcript"}})
+            .to_string(),
+        );
+        assert_eq!(ui.input_feedback.get_untracked(), "Nenhuma fala detectada.");
+        ui.event(
+            json!({"kind":"state.changed","session_id":0,"generation":0,
+            "payload":{"state":"listening"}})
+            .to_string(),
+        );
+        assert_eq!(ui.input_feedback.get_untracked(), "Nenhuma fala detectada.");
+        ui.active_stream.set(Some(1));
+        ui.stream_event(
+            ui.epoch.get_untracked(),
+            0,
+            1,
+            json!({"kind":"state.changed","session_id":0,"generation":5,
+                "payload":{"state":"listening"}})
+            .to_string(),
+        );
+        assert_eq!(ui.input_feedback.get_untracked(), "Nenhuma fala detectada.");
+        ui.stream_event(
+            ui.epoch.get_untracked(),
+            0,
+            1,
+            json!({"kind":"input.feedback","session_id":0,"generation":5,
+                "payload":{"reason":"empty_transcript"}})
+            .to_string(),
+        );
+        assert_eq!(
+            ui.input_feedback.get_untracked(),
+            "Não foi possível reconhecer palavras no áudio. Tente novamente."
+        );
+        ui.stream_event(
+            ui.epoch.get_untracked(),
+            0,
+            1,
+            json!({"kind":"state.changed","session_id":0,"generation":5,
+                "payload":{"state":"listening"}})
+            .to_string(),
+        );
+        assert_eq!(
+            ui.input_feedback.get_untracked(),
+            "Não foi possível reconhecer palavras no áudio. Tente novamente."
+        );
+        ui.stream_event(
+            ui.epoch.get_untracked(),
+            0,
+            1,
+            json!({"kind":"transcript.final","session_id":0,"generation":5,
+                "payload":{"text":"olá"}})
+            .to_string(),
+        );
+        assert!(ui.input_feedback.get_untracked().is_empty());
+    }
+
+    #[test]
+    fn blocker_notices_are_silent_for_local_selection_states() {
+        assert_eq!(VoiceBlocker::Provider.notice(), Some("provider"));
+        assert_eq!(VoiceBlocker::Models.notice(), Some("models"));
+        assert_eq!(VoiceBlocker::Input.notice(), Some("capture"));
+        assert_eq!(VoiceBlocker::InvalidInput.notice(), Some("capture"));
+        assert_eq!(VoiceBlocker::UnsavedInput.notice(), None);
+        assert_eq!(VoiceBlocker::SavingInput.notice(), None);
+        let unsaved = VoiceBlocker::UnsavedInput.message(&json!({}));
+        assert!(unsaved.contains("não foram salvas") && unsaved.contains("texto continua"));
+        let saving = VoiceBlocker::SavingInput.message(&json!({}));
+        assert!(saving.contains("sendo salva") && saving.contains("texto continua"));
     }
 
     #[test]
@@ -1690,9 +2074,9 @@ mod tests {
                 .message(&json!({}))
                 .contains("microfone")
         );
-        assert_eq!(VoiceBlocker::Provider.notice(), "provider");
-        assert_eq!(VoiceBlocker::Models.notice(), "models");
-        assert_eq!(VoiceBlocker::Input.notice(), "capture");
+        assert_eq!(VoiceBlocker::Provider.notice(), Some("provider"));
+        assert_eq!(VoiceBlocker::Models.notice(), Some("models"));
+        assert_eq!(VoiceBlocker::Input.notice(), Some("capture"));
     }
 
     #[test]
@@ -1752,6 +2136,40 @@ mod tests {
             &json!({"message":"Falhou.","stage":"playback"}),
         );
         assert!(shown.contains("Falhou.") && shown.contains("dispositivo de saída"));
+    }
+
+    #[test]
+    fn partial_synthesis_failure_is_visual_only() {
+        let partial = json!({
+            "code":"AUDIO_ERROR",
+            "stage":"synthesis",
+            "partial":true,
+            "message":"Falhou.",
+            "attempted":2,
+            "synthesized":1,
+            "played":1
+        });
+        assert_eq!(notice_for_event("audio.error", &partial), None);
+        let shown = audio_event_message("audio.error", &partial);
+        assert!(shown.contains("Parte da resposta não pôde ser falada"));
+        assert!(shown.contains("visível por escrito"));
+        let total = json!({
+            "code":"AUDIO_ERROR",
+            "stage":"synthesis",
+            "partial":false,
+            "message":"Falhou."
+        });
+        assert_eq!(notice_for_event("audio.error", &total), Some("synthesis"));
+        assert_eq!(audio_event_message("audio.error", &total), "Falhou.");
+        let legacy = json!({"code":"AUDIO_ERROR","stage":"synthesis","message":"Falhou."});
+        assert_eq!(notice_for_event("audio.error", &legacy), Some("synthesis"));
+        let playback = json!({
+            "code":"DEVICE_UNAVAILABLE",
+            "stage":"playback",
+            "message":"Falhou."
+        });
+        assert_eq!(notice_for_event("audio.error", &playback), None);
+        assert!(audio_event_message("audio.error", &playback).contains("dispositivo de saída"));
     }
 
     #[test]

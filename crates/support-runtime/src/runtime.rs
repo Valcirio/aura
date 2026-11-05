@@ -81,6 +81,9 @@ impl Emitter {
     pub(crate) fn level(&self, level: f32, source: &str) {
         self.send("audio.level", json!({"rms":level,"source":source}));
     }
+    pub(crate) fn feedback(&self, reason: &str) {
+        self.send("input.feedback", json!({"reason":reason}));
+    }
     pub(crate) fn turn(&self) -> Self {
         Self {
             turn: uuid::Uuid::new_v4().simple().to_string(),
@@ -89,6 +92,73 @@ impl Emitter {
             ..self.clone()
         }
     }
+    pub(crate) fn trace(
+        &self,
+        stage: &str,
+        messages: Option<usize>,
+        deltas: Option<usize>,
+        code: Option<&str>,
+    ) {
+        if !trace_turns_enabled() {
+            return;
+        }
+        eprintln!(
+            "{}",
+            trace_line(
+                stage,
+                &TurnTrace {
+                    session: self.session,
+                    turn: &self.turn,
+                    generation: self.generation,
+                    sequence: self.sequence.load(Ordering::Relaxed),
+                    messages,
+                    deltas,
+                    code,
+                },
+            )
+        );
+    }
+}
+
+pub(crate) const TRACE_TURNS_ENV: &str = "AURA_TRACE_TURNS";
+
+fn capture_feedback(error: &AppError) -> Option<&'static str> {
+    (error.code == "EMPTY_SPEECH").then_some("empty_speech")
+}
+
+fn transcript_feedback(text: &str) -> Option<&'static str> {
+    text.trim().is_empty().then_some("empty_transcript")
+}
+
+pub(crate) struct TurnTrace<'a> {
+    pub(crate) session: i64,
+    pub(crate) turn: &'a str,
+    pub(crate) generation: u64,
+    pub(crate) sequence: u64,
+    pub(crate) messages: Option<usize>,
+    pub(crate) deltas: Option<usize>,
+    pub(crate) code: Option<&'a str>,
+}
+
+pub(crate) fn trace_turns_enabled() -> bool {
+    std::env::var(TRACE_TURNS_ENV).as_deref() == Ok("1")
+}
+
+pub(crate) fn trace_line(stage: &str, trace: &TurnTrace<'_>) -> String {
+    let mut line = format!(
+        "[turn-trace] stage={} session={} turn={} generation={} sequence={}",
+        stage, trace.session, trace.turn, trace.generation, trace.sequence
+    );
+    if let Some(messages) = trace.messages {
+        line.push_str(&format!(" messages={messages}"));
+    }
+    if let Some(deltas) = trace.deltas {
+        line.push_str(&format!(" deltas={deltas}"));
+    }
+    if let Some(code) = trace.code {
+        line.push_str(&format!(" code={code}"));
+    }
+    line
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct RunTicket {
@@ -913,11 +983,19 @@ impl Runtime {
                     || ready.state("listening"),
                 )
             })
-            .await
-            .map_err(|_| AppError::new("AUDIO_ERROR", "Captura de áudio interrompida"))?;
+            .await;
+            current.level(0., "input");
+            let capture = capture
+                .map_err(|_| AppError::new("AUDIO_ERROR", "Captura de áudio interrompida"))?;
             let samples = match capture {
-                Err(error) if error.code == "EMPTY_SPEECH" => continue,
-                other => other?,
+                Ok(samples) => samples,
+                Err(error) => {
+                    if let Some(reason) = capture_feedback(&error) {
+                        current.feedback(reason);
+                        continue;
+                    }
+                    return Err(error);
+                }
             };
             current.state("transcribing");
             let worker = current.backend.clone();
@@ -927,8 +1005,9 @@ impl Runtime {
             if current.cancel.is_cancelled() {
                 return Err(AppError::cancelled());
             }
-            if !text.trim().is_empty() {
-                self.turn(&text, &current).await?;
+            match transcript_feedback(&text) {
+                Some(reason) => current.feedback(reason),
+                None => self.turn(&text, &current).await?,
             }
             current = current.turn();
         }
@@ -948,6 +1027,7 @@ impl Runtime {
             db.append(emitter.session, "user", text)?;
         }
         emitter.send("transcript.final", json!({"text":text}));
+        emitter.trace("turn_start", None, None, None);
         let result = crate::agent::answer(self, text, emitter).await;
         let status = match &result {
             Ok(_) => "completed",
@@ -965,6 +1045,12 @@ impl Runtime {
             database(&self.db)?.append(emitter.session, "assistant", answer)?;
             emitter.send("turn.completed", json!({"text":answer}));
         }
+        emitter.trace(
+            "turn_end",
+            None,
+            None,
+            result.as_ref().err().map(|error| error.code.as_str()),
+        );
         result.map(|_| ())
     }
     pub(crate) async fn say(&self, text: &str, emitter: &Emitter) -> Result<String> {
@@ -1011,7 +1097,7 @@ impl Runtime {
             Ok(text) => Ok(text),
             Err((_, error)) if error.code == "CANCELLED" => Err(error),
             Err((stage, error)) => {
-                emitter.send("audio.error", audio_error_payload(error, stage));
+                emitter.send("audio.error", say_error_payload(&error, stage));
                 Ok(String::new())
             }
         }
@@ -1400,24 +1486,22 @@ const PCM_QUEUE: usize = 1;
 /// synthesis -> playback pipeline.
 pub(crate) struct Speaker {
     tx: Option<tokio::sync::mpsc::Sender<String>>,
-    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    task: Option<tokio::task::JoinHandle<Result<SpeechOutcome>>>,
 }
 impl Speaker {
     pub(crate) fn sender(&self) -> Option<tokio::sync::mpsc::Sender<String>> {
         self.tx.clone()
     }
-    /// Closes the sentence queue, waits for synthesis/playback, returns the played text.
     pub(crate) async fn finish(mut self, emitter: &Emitter) -> Result<String> {
         self.tx = None;
         if let Some(task) = self.task.take() {
-            let playback = task
+            let outcome = task
                 .await
-                .map_err(|_| AppError::new("AUDIO_ERROR", "Reprodução interrompida"))?;
-            if let Err(error) = playback {
-                if error.code == "CANCELLED" {
-                    return Err(error);
-                }
-                emitter.send("audio.error", audio_error_payload(error, "playback"));
+                .map_err(|_| AppError::new("AUDIO_ERROR", "Reprodução interrompida"))??;
+            if let Some(error) = &outcome.playback {
+                emitter.send("audio.error", playback_error_payload(error, &outcome));
+            } else if !outcome.errors.is_empty() {
+                emitter.send("audio.error", synthesis_error_payload(&outcome));
             }
         }
         Ok(emitter.played.lock().map(|s| s.clone()).unwrap_or_default())
@@ -1436,7 +1520,6 @@ impl Runtime {
         let (synth_worker, synth_event, synth_settings) =
             (emitter.backend.clone(), emitter.clone(), settings.clone());
         let (play_event, play_settings) = (emitter.clone(), settings.clone());
-        let error_event = emitter.clone();
         let playback = self.playback.clone();
         let task = tokio::spawn(speech_pipeline(
             rx,
@@ -1461,9 +1544,6 @@ impl Runtime {
                 )
             }),
             played,
-            Arc::new(move |error: AppError| {
-                error_event.send("audio.error", audio_error_payload(error, "synthesis"))
-            }),
         ));
         Speaker {
             tx: Some(tx),
@@ -1493,93 +1573,175 @@ pub(crate) fn send_sentence(
     }
 }
 
+#[derive(Debug, Default)]
+struct SpeechOutcome {
+    attempted: usize,
+    synthesized: usize,
+    played: usize,
+    errors: Vec<AppError>,
+    playback: Option<AppError>,
+    cancelled: bool,
+}
+
 /// Two-stage ordered pipeline: synthesis -> bounded PCM queue -> playback.
-/// Synthesis failures are reported through `on_error` and skipped; playback failures stop
-/// everything. Returns only after both stages (and their blocking calls) have finished.
-async fn speech_pipeline<S, P, E>(
+async fn speech_pipeline<S, P>(
     mut sentences: tokio::sync::mpsc::Receiver<String>,
     cancel: CancellationToken,
     synth: Arc<S>,
     play: Arc<P>,
     played: Arc<Mutex<String>>,
-    on_error: Arc<E>,
-) -> Result<()>
+) -> Result<SpeechOutcome>
 where
     S: Fn(&str) -> Result<speech::Pcm> + Send + Sync + 'static,
     P: Fn(speech::Pcm) -> Result<()> + Send + Sync + 'static,
-    E: Fn(AppError) + Send + Sync + 'static,
 {
     let stop = cancel.child_token();
     let (pcm_tx, mut pcm_rx) = tokio::sync::mpsc::channel::<(String, speech::Pcm)>(PCM_QUEUE);
     let synth_stop = stop.clone();
     let synth_task = tokio::spawn(async move {
+        let mut outcome = SpeechOutcome::default();
         loop {
             let text = tokio::select! {
                 biased;
-                _ = synth_stop.cancelled() => return Err(AppError::cancelled()),
-                next = sentences.recv() => match next { Some(text) => text, None => return Ok(()) },
+                _ = synth_stop.cancelled() => {
+                    outcome.cancelled = true;
+                    return outcome;
+                }
+                next = sentences.recv() => match next { Some(text) => text, None => return outcome },
             };
+            outcome.attempted += 1;
             let (worker, input) = (synth.clone(), text.clone());
-            let pcm = tokio::task::spawn_blocking(move || worker(&input))
-                .await
-                .map_err(|_| AppError::new("AUDIO_ERROR", "Síntese interrompida"))?;
+            let pcm = tokio::task::spawn_blocking(move || worker(&input)).await;
+            if synth_stop.is_cancelled() {
+                outcome.cancelled = true;
+                return outcome;
+            }
             match pcm {
-                Ok(pcm) => {
+                Err(_) => {
+                    outcome
+                        .errors
+                        .push(AppError::new("AUDIO_ERROR", "Síntese interrompida"));
+                    return outcome;
+                }
+                Ok(Err(error)) if error.code == "CANCELLED" => {
+                    outcome.cancelled = true;
+                    return outcome;
+                }
+                Ok(Err(error)) => outcome.errors.push(error),
+                Ok(Ok(pcm)) if pcm.samples.is_empty() => {
+                    outcome
+                        .errors
+                        .push(AppError::new("AUDIO_ERROR", "Síntese retornou áudio vazio"));
+                }
+                Ok(Ok(pcm)) => {
+                    outcome.synthesized += 1;
                     tokio::select! {
                         biased;
-                        _ = synth_stop.cancelled() => return Err(AppError::cancelled()),
-                        sent = pcm_tx.send((text, pcm)) => if sent.is_err() { return Ok(()) },
+                        _ = synth_stop.cancelled() => {
+                            outcome.cancelled = true;
+                            return outcome;
+                        }
+                        sent = pcm_tx.send((text, pcm)) => if sent.is_err() { return outcome },
                     }
                 }
-                Err(error) if error.code == "CANCELLED" => return Err(error),
-                Err(error) => on_error(error),
             }
         }
     });
     let play_stop = stop.clone();
     let play_task = tokio::spawn(async move {
+        let mut outcome = SpeechOutcome::default();
         loop {
             let (text, pcm) = tokio::select! {
                 biased;
-                _ = play_stop.cancelled() => return Err(AppError::cancelled()),
-                next = pcm_rx.recv() => match next { Some(item) => item, None => return Ok(()) },
+                _ = play_stop.cancelled() => {
+                    outcome.cancelled = true;
+                    return outcome;
+                }
+                next = pcm_rx.recv() => match next { Some(item) => item, None => return outcome },
             };
             let player = play.clone();
-            let result = tokio::task::spawn_blocking(move || player(pcm))
-                .await
-                .map_err(|_| AppError::new("AUDIO_ERROR", "Reprodução interrompida"))
-                .and_then(|r| r);
-            if let Err(error) = result {
-                play_stop.cancel();
-                return Err(error);
+            let result = tokio::task::spawn_blocking(move || player(pcm)).await;
+            if play_stop.is_cancelled() {
+                outcome.cancelled = true;
+                return outcome;
             }
+            if let Err(error) = result
+                .map_err(|_| AppError::new("AUDIO_ERROR", "Reprodução interrompida"))
+                .and_then(|r| r)
+            {
+                play_stop.cancel();
+                outcome.playback = Some(error);
+                return outcome;
+            }
+            outcome.played += 1;
             if let Ok(mut played) = played.lock() {
                 played.push_str(&text);
             }
         }
     });
-    let playback = play_task
-        .await
-        .map_err(|_| AppError::new("AUDIO_ERROR", "Reprodução interrompida"))
-        .and_then(|r| r);
-    if playback.is_err() {
+    let playback = play_task.await.unwrap_or_else(|_| SpeechOutcome {
+        playback: Some(AppError::new("AUDIO_ERROR", "Reprodução interrompida")),
+        ..Default::default()
+    });
+    if playback.playback.is_some() {
         stop.cancel();
     }
-    let synthesis = synth_task
-        .await
-        .map_err(|_| AppError::new("AUDIO_ERROR", "Síntese interrompida"))
-        .and_then(|r| r);
-    match (playback, synthesis) {
-        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-        _ => Ok(()),
+    let synthesis = synth_task.await.unwrap_or_else(|_| SpeechOutcome {
+        errors: vec![AppError::new("AUDIO_ERROR", "Síntese interrompida")],
+        ..Default::default()
+    });
+    let mut outcome = SpeechOutcome {
+        attempted: synthesis.attempted,
+        synthesized: synthesis.synthesized,
+        played: playback.played,
+        errors: synthesis.errors,
+        playback: playback.playback,
+        cancelled: synthesis.cancelled || playback.cancelled,
+    };
+    if outcome.playback.is_some() {
+        outcome.errors.clear();
+        outcome.cancelled = false;
     }
+    if outcome.cancelled {
+        return Err(AppError::cancelled());
+    }
+    Ok(outcome)
 }
 
-/// `audio.error` payload: the structured error plus the failing `stage`
-/// (`synthesis` or `playback`) so the UI can tell them apart.
-fn audio_error_payload(error: AppError, stage: &str) -> Value {
+fn synthesis_error_payload(outcome: &SpeechOutcome) -> Value {
+    let first = outcome
+        .errors
+        .first()
+        .cloned()
+        .unwrap_or_else(|| AppError::new("AUDIO_ERROR", "Síntese interrompida"));
+    let mut payload = serde_json::to_value(first).unwrap_or_default();
+    payload["stage"] = json!("synthesis");
+    payload["partial"] = json!(outcome.played > 0);
+    payload["attempted"] = json!(outcome.attempted);
+    payload["synthesized"] = json!(outcome.synthesized);
+    payload["played"] = json!(outcome.played);
+    payload["errors"] = json!(&outcome.errors);
+    payload
+}
+
+fn playback_error_payload(error: &AppError, outcome: &SpeechOutcome) -> Value {
+    let mut payload = serde_json::to_value(error).unwrap_or_default();
+    payload["stage"] = json!("playback");
+    payload["attempted"] = json!(outcome.attempted);
+    payload["synthesized"] = json!(outcome.synthesized);
+    payload["played"] = json!(outcome.played);
+    payload
+}
+
+fn say_error_payload(error: &AppError, stage: &str) -> Value {
     let mut payload = serde_json::to_value(error).unwrap_or_default();
     payload["stage"] = json!(stage);
+    if stage == "synthesis" {
+        payload["partial"] = json!(false);
+        payload["attempted"] = json!(1);
+        payload["synthesized"] = json!(0);
+        payload["played"] = json!(0);
+    }
     payload
 }
 
@@ -1704,6 +1866,61 @@ mod tests {
         assert!(events.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn empty_capture_and_empty_transcript_have_distinct_nonspoken_feedback() {
+        let empty_speech = AppError::new("EMPTY_SPEECH", "Nenhuma fala detectada.");
+        assert_eq!(capture_feedback(&empty_speech), Some("empty_speech"));
+        for code in [
+            "CANCELLED",
+            "DEVICE_UNAVAILABLE",
+            "AUDIO_FORMAT",
+            "AUDIO_ERROR",
+        ] {
+            assert_eq!(capture_feedback(&AppError::new(code, "x")), None, "{code}");
+        }
+        assert_eq!(transcript_feedback(""), Some("empty_transcript"));
+        assert_eq!(transcript_feedback(" \n\t "), Some("empty_transcript"));
+        assert_eq!(transcript_feedback("olá"), None);
+        assert_eq!(transcript_feedback("  olá  "), None);
+        assert_ne!(capture_feedback(&empty_speech), transcript_feedback(" "));
+    }
+
+    #[test]
+    fn empty_feedback_is_visual_only_and_creates_no_turn() {
+        let events: Events = Default::default();
+        let output = events.clone();
+        let token = CancellationToken::new();
+        let emitter = emitter(
+            7,
+            token.clone(),
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+        );
+        emitter.feedback(capture_feedback(&AppError::new("EMPTY_SPEECH", "x")).unwrap());
+        emitter.feedback(transcript_feedback("   ").unwrap());
+        let log = events.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(
+            log.iter()
+                .all(|event| event.kind == "input.feedback" && event.turn_id == "test")
+        );
+        assert_eq!(log[0].payload, json!({"reason":"empty_speech"}));
+        assert_eq!(log[1].payload, json!({"reason":"empty_transcript"}));
+        assert!(!log.iter().any(|event| {
+            [
+                "transcript.final",
+                "turn.completed",
+                "run.started",
+                "error",
+                "audio.error",
+            ]
+            .contains(&event.kind.as_str())
+        }));
+        drop(log);
+        token.cancel();
+        emitter.feedback("empty_speech");
+        assert_eq!(events.lock().unwrap().len(), 2);
+    }
+
     // ---- speech pipeline (fake synthesis/playback) ----
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -1723,6 +1940,46 @@ mod tests {
         false
     }
     type Texts = Arc<Mutex<Vec<String>>>;
+    type Events = Arc<Mutex<Vec<AppEvent>>>;
+    fn event_log() -> (Events, EventSink) {
+        let events: Events = Default::default();
+        let output = events.clone();
+        (
+            events,
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+        )
+    }
+    fn audio_errors(events: &Events) -> Vec<Value> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "audio.error")
+            .map(|event| event.payload.clone())
+            .collect()
+    }
+    fn speaker(
+        tx: tokio::sync::mpsc::Sender<String>,
+        task: tokio::task::JoinHandle<Result<SpeechOutcome>>,
+    ) -> Speaker {
+        Speaker {
+            tx: Some(tx),
+            task: Some(task),
+        }
+    }
+    fn pipeline<S, P>(
+        rx: tokio::sync::mpsc::Receiver<String>,
+        cancel: CancellationToken,
+        synth: Arc<S>,
+        play: Arc<P>,
+        played: Arc<Mutex<String>>,
+    ) -> tokio::task::JoinHandle<Result<SpeechOutcome>>
+    where
+        S: Fn(&str) -> Result<speech::Pcm> + Send + Sync + 'static,
+        P: Fn(speech::Pcm) -> Result<()> + Send + Sync + 'static,
+    {
+        tokio::spawn(speech_pipeline(rx, cancel, synth, play, played))
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn synthesis_overlaps_playback_in_order_with_accounting() {
@@ -1751,20 +2008,25 @@ mod tests {
                 Ok(())
             })
         };
-        let task = tokio::spawn(speech_pipeline(
+        let task = pipeline(
             rx,
             CancellationToken::new(),
             synth.clone(),
             play.clone(),
             played.clone(),
-            Arc::new(|_| panic!("no errors expected")),
-        ));
+        );
         for text in ["a", "b", "c"] {
             tx.send(text.to_string()).await.unwrap();
         }
         drop(tx);
-        task.await.unwrap().unwrap();
+        let outcome = task.await.unwrap().unwrap();
         assert_eq!(*started.lock().unwrap(), ["a", "b", "c"]);
+        assert_eq!(outcome.attempted, 3);
+        assert_eq!(outcome.synthesized, 3);
+        assert_eq!(outcome.played, 3);
+        assert!(outcome.errors.is_empty());
+        assert!(outcome.playback.is_none());
+        assert!(!outcome.cancelled);
         assert_eq!(*played.lock().unwrap(), "abc");
         assert_eq!(Arc::strong_count(&synth), 1);
         assert_eq!(Arc::strong_count(&play), 1);
@@ -1790,14 +2052,7 @@ mod tests {
                 Ok(())
             })
         };
-        let task = tokio::spawn(speech_pipeline(
-            rx,
-            CancellationToken::new(),
-            synth,
-            play,
-            played.clone(),
-            Arc::new(|_| {}),
-        ));
+        let task = pipeline(rx, CancellationToken::new(), synth, play, played.clone());
         let mut accepted = 0;
         for _ in 0..10 {
             if tx.try_send("x".into()).is_ok() {
@@ -1810,7 +2065,10 @@ mod tests {
         assert!(accepted <= 3 + SENTENCE_QUEUE);
         release.store(true, Ordering::SeqCst);
         drop(tx);
-        task.await.unwrap().unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome.attempted, accepted);
+        assert_eq!(outcome.synthesized, accepted);
+        assert_eq!(outcome.played, accepted);
         assert_eq!(played.lock().unwrap().len(), accepted);
     }
 
@@ -1829,14 +2087,13 @@ mod tests {
                 Err(AppError::cancelled())
             })
         };
-        let task = tokio::spawn(speech_pipeline(
+        let task = pipeline(
             rx,
             cancel.clone(),
             synth.clone(),
             play.clone(),
             played.clone(),
-            Arc::new(|_| {}),
-        ));
+        );
         for _ in 0..10 {
             let _ = tx.try_send("x".into());
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1855,13 +2112,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthesis_error_is_reported_and_skipped() {
+    async fn partial_synthesis_failure_emits_one_summary() {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(SENTENCE_QUEUE);
-        let errors = Arc::new(AtomicUsize::new(0));
-        let played = Arc::new(Mutex::new(String::new()));
-        let task = tokio::spawn(speech_pipeline(
+        let (events, sink) = event_log();
+        let emitter = emitter(1, CancellationToken::new(), sink);
+        let task = pipeline(
             rx,
-            CancellationToken::new(),
+            emitter.cancel.clone(),
             Arc::new(|text: &str| {
                 if text == "b" {
                     Err(AppError::new("AUDIO_ERROR", "falha"))
@@ -1870,21 +2127,273 @@ mod tests {
                 }
             }),
             Arc::new(|_| Ok(())),
-            played.clone(),
-            {
-                let errors = errors.clone();
-                Arc::new(move |_| {
-                    errors.fetch_add(1, Ordering::SeqCst);
-                })
-            },
-        ));
+            emitter.played.clone(),
+        );
+        let speaker = speaker(tx.clone(), task);
         for text in ["a", "b", "c"] {
             tx.send(text.into()).await.unwrap();
         }
         drop(tx);
-        task.await.unwrap().unwrap();
-        assert_eq!(errors.load(Ordering::SeqCst), 1);
-        assert_eq!(*played.lock().unwrap(), "ac");
+        let spoken = tokio::time::timeout(Duration::from_secs(5), speaker.finish(&emitter))
+            .await
+            .expect("pipeline must join")
+            .unwrap();
+        assert_eq!(spoken, "ac");
+        let errors = audio_errors(&events);
+        assert_eq!(errors.len(), 1);
+        let payload = &errors[0];
+        assert_eq!(payload["stage"], "synthesis");
+        assert_eq!(payload["code"], "AUDIO_ERROR");
+        assert_eq!(payload["message"], "falha");
+        assert_eq!(payload["partial"], true);
+        assert_eq!(payload["attempted"], 3);
+        assert_eq!(payload["synthesized"], 2);
+        assert_eq!(payload["played"], 2);
+        let details = payload["errors"].as_array().unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["message"], "falha");
+        assert!(payload.get("text").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn total_synthesis_failure_emits_one_nonpartial_summary() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(SENTENCE_QUEUE);
+        let (events, sink) = event_log();
+        let emitter = emitter(1, CancellationToken::new(), sink);
+        let task = pipeline(
+            rx,
+            emitter.cancel.clone(),
+            Arc::new(|_: &str| Err(AppError::new("AUDIO_ERROR", "falha total").retryable())),
+            Arc::new(|_| panic!("playback must not run")),
+            emitter.played.clone(),
+        );
+        let speaker = speaker(tx.clone(), task);
+        for text in ["a", "b"] {
+            tx.send(text.into()).await.unwrap();
+        }
+        drop(tx);
+        let spoken = tokio::time::timeout(Duration::from_secs(5), speaker.finish(&emitter))
+            .await
+            .expect("pipeline must join")
+            .unwrap();
+        assert!(spoken.is_empty());
+        let errors = audio_errors(&events);
+        assert_eq!(errors.len(), 1);
+        let payload = &errors[0];
+        assert_eq!(payload["stage"], "synthesis");
+        assert_eq!(payload["message"], "falha total");
+        assert_eq!(payload["retryable"], true);
+        assert_eq!(payload["partial"], false);
+        assert_eq!(payload["attempted"], 2);
+        assert_eq!(payload["synthesized"], 0);
+        assert_eq!(payload["played"], 0);
+        assert_eq!(payload["errors"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_pcm_is_a_synthesis_failure_not_success() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(SENTENCE_QUEUE);
+        let (events, sink) = event_log();
+        let emitter = emitter(1, CancellationToken::new(), sink);
+        let task = pipeline(
+            rx,
+            emitter.cancel.clone(),
+            Arc::new(|_: &str| {
+                Ok(speech::Pcm {
+                    sample_rate: 24000,
+                    samples: Vec::new(),
+                })
+            }),
+            Arc::new(|_| panic!("playback must not run")),
+            emitter.played.clone(),
+        );
+        let speaker = speaker(tx.clone(), task);
+        tx.send("a".into()).await.unwrap();
+        drop(tx);
+        let spoken = tokio::time::timeout(Duration::from_secs(5), speaker.finish(&emitter))
+            .await
+            .expect("pipeline must join")
+            .unwrap();
+        assert!(spoken.is_empty());
+        let errors = audio_errors(&events);
+        assert_eq!(errors.len(), 1);
+        let payload = &errors[0];
+        assert_eq!(payload["stage"], "synthesis");
+        assert_eq!(payload["code"], "AUDIO_ERROR");
+        assert!(payload["message"].as_str().unwrap().contains("vazio"));
+        assert_eq!(payload["partial"], false);
+        assert_eq!(payload["attempted"], 1);
+        assert_eq!(payload["synthesized"], 0);
+        assert_eq!(payload["played"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn playback_failure_wins_over_blocked_synthesis() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(SENTENCE_QUEUE);
+        let (events, sink) = event_log();
+        let emitter = emitter(1, CancellationToken::new(), sink);
+        let b_started = Arc::new(AtomicBool::new(false));
+        let playback_failed = Arc::new(AtomicBool::new(false));
+        let synth = {
+            let (b_started, playback_failed) = (b_started.clone(), playback_failed.clone());
+            Arc::new(move |text: &str| {
+                if text == "b" {
+                    b_started.store(true, Ordering::SeqCst);
+                    assert!(wait_until(|| playback_failed.load(Ordering::SeqCst)));
+                    return Err(AppError::new("AUDIO_ERROR", "síntese tardia"));
+                }
+                Ok(pcm())
+            })
+        };
+        let play = {
+            let (b_started, playback_failed) = (b_started.clone(), playback_failed.clone());
+            Arc::new(move |_: speech::Pcm| {
+                assert!(wait_until(|| b_started.load(Ordering::SeqCst)));
+                playback_failed.store(true, Ordering::SeqCst);
+                Err(AppError::new("DEVICE_UNAVAILABLE", "saída indisponível"))
+            })
+        };
+        let task = pipeline(
+            rx,
+            emitter.cancel.clone(),
+            synth.clone(),
+            play.clone(),
+            emitter.played.clone(),
+        );
+        let speaker = speaker(tx.clone(), task);
+        tx.send("a".into()).await.unwrap();
+        tx.send("b".into()).await.unwrap();
+        drop(tx);
+        let spoken = tokio::time::timeout(Duration::from_secs(5), speaker.finish(&emitter))
+            .await
+            .expect("pipeline must join")
+            .unwrap();
+        assert!(spoken.is_empty());
+        let errors = audio_errors(&events);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["stage"], "playback");
+        assert_eq!(errors[0]["code"], "DEVICE_UNAVAILABLE");
+        assert_eq!(errors[0]["message"], "saída indisponível");
+        assert_eq!(errors[0]["attempted"], 2);
+        assert_eq!(errors[0]["synthesized"], 1);
+        assert_eq!(errors[0]["played"], 0);
+        assert!(errors[0].get("errors").is_none());
+        assert_eq!(Arc::strong_count(&synth), 1);
+        assert_eq!(Arc::strong_count(&play), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn synthesis_panic_is_reported_as_synthesis() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(SENTENCE_QUEUE);
+        let (events, sink) = event_log();
+        let emitter = emitter(1, CancellationToken::new(), sink);
+        let synth = Arc::new(|_: &str| -> Result<speech::Pcm> { panic!("falha sintética") });
+        let play = Arc::new(|_| panic!("playback must not run"));
+        let task = pipeline(
+            rx,
+            emitter.cancel.clone(),
+            synth.clone(),
+            play.clone(),
+            emitter.played.clone(),
+        );
+        let speaker = speaker(tx.clone(), task);
+        tx.send("a".into()).await.unwrap();
+        drop(tx);
+        let spoken = tokio::time::timeout(Duration::from_secs(5), speaker.finish(&emitter))
+            .await
+            .expect("pipeline must join")
+            .unwrap();
+        assert!(spoken.is_empty());
+        let errors = audio_errors(&events);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["stage"], "synthesis");
+        assert_eq!(errors[0]["code"], "AUDIO_ERROR");
+        assert_eq!(errors[0]["message"], "Síntese interrompida");
+        assert_eq!(errors[0]["partial"], false);
+        assert_eq!(errors[0]["attempted"], 1);
+        assert_eq!(errors[0]["synthesized"], 0);
+        assert_eq!(errors[0]["played"], 0);
+        assert_eq!(Arc::strong_count(&synth), 1);
+        assert_eq!(Arc::strong_count(&play), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancellation_while_synthesis_is_blocked_is_silent() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(SENTENCE_QUEUE);
+        let (events, sink) = event_log();
+        let cancel = CancellationToken::new();
+        let emitter = emitter(1, cancel.clone(), sink);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let synth = {
+            let (started, release) = (started.clone(), release.clone());
+            Arc::new(move |_: &str| {
+                started.store(true, Ordering::SeqCst);
+                assert!(wait_until(|| release.load(Ordering::SeqCst)));
+                Err(AppError::new("AUDIO_ERROR", "síntese tardia"))
+            })
+        };
+        let play = Arc::new(|_| Ok(()));
+        let task = pipeline(
+            rx,
+            cancel.clone(),
+            synth.clone(),
+            play.clone(),
+            emitter.played.clone(),
+        );
+        let speaker = speaker(tx.clone(), task);
+        tx.send("a".into()).await.unwrap();
+        assert!(wait_until(|| started.load(Ordering::SeqCst)));
+        cancel.cancel();
+        release.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(5), speaker.finish(&emitter))
+            .await
+            .expect("pipeline must join after cancellation")
+            .unwrap_err();
+        assert_eq!(result.code, "CANCELLED");
+        assert!(audio_errors(&events).is_empty());
+        assert!(emitter.played.lock().unwrap().is_empty());
+        assert_eq!(Arc::strong_count(&synth), 1);
+        assert_eq!(Arc::strong_count(&play), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_replacement_before_release_emits_no_stale_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(SENTENCE_QUEUE);
+        let (events, sink) = event_log();
+        let emitter = emitter(1, CancellationToken::new(), sink);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let synth = {
+            let (started, release) = (started.clone(), release.clone());
+            Arc::new(move |_: &str| {
+                started.store(true, Ordering::SeqCst);
+                assert!(wait_until(|| release.load(Ordering::SeqCst)));
+                Err(AppError::new("AUDIO_ERROR", "falha"))
+            })
+        };
+        let play = Arc::new(|_| Ok(()));
+        let task = pipeline(
+            rx,
+            emitter.cancel.clone(),
+            synth.clone(),
+            play.clone(),
+            emitter.played.clone(),
+        );
+        let speaker = speaker(tx.clone(), task);
+        tx.send("a".into()).await.unwrap();
+        assert!(wait_until(|| started.load(Ordering::SeqCst)));
+        emitter.current.store(2, Ordering::SeqCst);
+        release.store(true, Ordering::SeqCst);
+        drop(tx);
+        let spoken = tokio::time::timeout(Duration::from_secs(5), speaker.finish(&emitter))
+            .await
+            .expect("pipeline must join")
+            .unwrap();
+        assert!(spoken.is_empty());
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(Arc::strong_count(&synth), 1);
+        assert_eq!(Arc::strong_count(&play), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1901,20 +2410,21 @@ mod tests {
         };
         let play =
             Arc::new(move |_: speech::Pcm| Err(AppError::new("AUDIO_ERROR", "saída indisponível")));
-        let task = tokio::spawn(speech_pipeline(
+        let task = pipeline(
             rx,
             CancellationToken::new(),
             synth.clone(),
             play.clone(),
             played.clone(),
-            Arc::new(|_| {}),
-        ));
+        );
         tx.send("a".into()).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("pipeline must stop")
             .unwrap();
-        assert_eq!(result.unwrap_err().code, "AUDIO_ERROR");
+        let outcome = result.unwrap();
+        assert_eq!(outcome.playback.unwrap().code, "AUDIO_ERROR");
+        assert!(outcome.errors.is_empty());
         assert!(played.lock().unwrap().is_empty());
         assert!(tx.is_closed());
         assert_eq!(Arc::strong_count(&synth), 1);
@@ -2216,6 +2726,36 @@ mod tests {
         let revision = runtime.provider_revision.load(Ordering::SeqCst);
         runtime.publish_probe(revision, Some(&current)).unwrap();
         assert_eq!(runtime.probe_status().unwrap()["verified_at"], 7);
+    }
+
+    #[test]
+    fn turn_trace_line_is_metadata_only() {
+        let synthetic = concat!("CONTEUDO", "_SINTETICO_DO_TESTE");
+        let credential = concat!("sk-", "credencial-sintetica");
+        let trace = TurnTrace {
+            session: 7,
+            turn: "turno-sintetico",
+            generation: 3,
+            sequence: 11,
+            messages: Some(4),
+            deltas: Some(5),
+            code: Some("PROVIDER_ERROR"),
+        };
+        let line = trace_line("provider_round_end", &trace);
+        assert!(line.contains("stage=provider_round_end"));
+        assert!(line.contains("session=7"));
+        assert!(line.contains("turn=turno-sintetico"));
+        assert!(line.contains("generation=3"));
+        assert!(line.contains("sequence=11"));
+        assert!(line.contains("messages=4"));
+        assert!(line.contains("deltas=5"));
+        assert!(line.contains("code=PROVIDER_ERROR"));
+        assert!(!line.contains(synthetic));
+        assert!(!line.contains(credential));
+        assert!(!line.contains("http"));
+        assert!(
+            !line.contains(&json!({"messages":[{"role":"user","content":synthetic}]}).to_string())
+        );
     }
 }
 

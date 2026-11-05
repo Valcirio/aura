@@ -3,6 +3,8 @@ use crate::{
     speech::{Pcm, SpeechBackend},
 };
 use serde::Serialize;
+#[cfg(any(feature = "native-audio", test))]
+use serde_json::json;
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "native-audio")]
 use std::sync::{
@@ -17,6 +19,96 @@ pub struct AudioDevice {
     pub name: String,
     pub direction: String,
     pub default: bool,
+}
+
+#[cfg(any(feature = "native-audio", test))]
+const DEVICE_ID_PREFIX: &str = "v1:";
+#[cfg(any(feature = "native-audio", test))]
+const DEVICE_RESELECT: &str = "Selecione novamente o dispositivo nas configurações de áudio.";
+
+#[cfg(any(feature = "native-audio", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct DeviceId {
+    direction: String,
+    name: String,
+}
+
+#[cfg(any(feature = "native-audio", test))]
+fn device_unavailable(reason: &str) -> AppError {
+    AppError::new("DEVICE_UNAVAILABLE", format!("{reason} {DEVICE_RESELECT}"))
+}
+
+#[cfg(any(feature = "native-audio", test))]
+fn device_id(direction: &str, name: &str) -> String {
+    format!("{DEVICE_ID_PREFIX}{}", json!([direction, name]))
+}
+
+#[cfg(any(feature = "native-audio", test))]
+fn parse_device_id(id: &str) -> Result<DeviceId> {
+    let malformed = || device_unavailable("O identificador do dispositivo salvo é inválido.");
+    let Some(encoded) = id.strip_prefix(DEVICE_ID_PREFIX) else {
+        return Err(device_unavailable(
+            "O dispositivo salvo usa um formato anterior de identificação.",
+        ));
+    };
+    let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| malformed())?;
+    let Some(parts) = value.as_array().filter(|parts| parts.len() == 2) else {
+        return Err(malformed());
+    };
+    let (Some(direction), Some(name)) = (parts[0].as_str(), parts[1].as_str()) else {
+        return Err(malformed());
+    };
+    if direction.is_empty() || name.is_empty() {
+        return Err(malformed());
+    }
+    Ok(DeviceId {
+        direction: direction.into(),
+        name: name.into(),
+    })
+}
+
+#[cfg(any(feature = "native-audio", test))]
+fn resolve_device(direction: &str, id: &str, names: &[Option<&str>]) -> Result<usize> {
+    let parsed = parse_device_id(id)?;
+    if parsed.direction != direction {
+        return Err(device_unavailable(
+            "O dispositivo salvo pertence a outra direção de áudio.",
+        ));
+    }
+    let mut found = None;
+    for (index, name) in names.iter().enumerate() {
+        let Some(name) = name else {
+            return Err(device_unavailable(
+                "Não foi possível ler o nome de todos os dispositivos disponíveis.",
+            ));
+        };
+        if *name == parsed.name {
+            if found.is_some() {
+                return Err(device_unavailable(
+                    "Existem vários dispositivos com o mesmo nome.",
+                ));
+            }
+            found = Some(index);
+        }
+    }
+    found.ok_or_else(|| device_unavailable("O dispositivo salvo não foi encontrado."))
+}
+
+#[cfg(any(feature = "native-audio", test))]
+fn unique_device_names(names: &[Option<String>]) -> Vec<String> {
+    let mut unique = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let Some(name) = name else {
+            continue;
+        };
+        let duplicated = names.iter().enumerate().any(|(other, candidate)| {
+            other != index && candidate.as_deref() == Some(name.as_str())
+        });
+        if !duplicated {
+            unique.push(name.clone());
+        }
+    }
+    unique
 }
 
 #[cfg(feature = "native-audio")]
@@ -35,20 +127,18 @@ mod native {
             ("input", host.input_devices(), default_in),
             ("output", host.output_devices(), default_out),
         ] {
-            for (index, device) in list
-                .map_err(|_| {
-                    AppError::new(
-                        "DEVICE_UNAVAILABLE",
-                        "Não foi possível listar os dispositivos",
-                    )
-                })?
-                .enumerate()
-            {
-                let name = device
-                    .name()
-                    .unwrap_or_else(|_| format!("Dispositivo {index}"));
+            let mut names = Vec::new();
+            for device in list.map_err(|_| {
+                AppError::new(
+                    "DEVICE_UNAVAILABLE",
+                    "Não foi possível listar os dispositivos",
+                )
+            })? {
+                names.push(device.name().ok());
+            }
+            for name in unique_device_names(&names) {
                 result.push(AudioDevice {
-                    id: format!("{direction}:{index}"),
+                    id: device_id(direction, &name),
                     default: default.as_ref() == Some(&name),
                     name,
                     direction: direction.into(),
@@ -59,34 +149,42 @@ mod native {
     }
     fn device(input: bool, id: Option<&str>) -> Result<cpal::Device> {
         let host = cpal::default_host();
-        let selected = if let Some(id) = id {
-            let (kind, index) = id
-                .split_once(':')
-                .ok_or_else(|| AppError::invalid("Dispositivo inválido"))?;
-            if kind != if input { "input" } else { "output" } {
-                return Err(AppError::invalid("Direção de dispositivo inválida"));
-            }
-            let index = index
-                .parse::<usize>()
-                .map_err(|_| AppError::invalid("Dispositivo inválido"))?;
-            if input {
-                host.input_devices()
+        let Some(id) = id else {
+            return if input {
+                host.default_input_device()
             } else {
-                host.output_devices()
+                host.default_output_device()
             }
-            .ok()
-            .and_then(|mut list| list.nth(index))
-        } else if input {
-            host.default_input_device()
-        } else {
-            host.default_output_device()
+            .ok_or_else(|| device_unavailable("O dispositivo padrão do sistema não existe."));
         };
-        selected.ok_or_else(|| {
+        let direction = if input { "input" } else { "output" };
+        let listed = if input {
+            host.input_devices()
+        } else {
+            host.output_devices()
+        }
+        .map_err(|_| {
             AppError::new(
                 "DEVICE_UNAVAILABLE",
-                "Dispositivo de áudio não encontrado. Atualize a lista em Configurações.",
+                "Não foi possível listar os dispositivos",
             )
-        })
+        })?;
+        let devices = listed
+            .map(|device| {
+                let name = device.name().ok();
+                (device, name)
+            })
+            .collect::<Vec<_>>();
+        let names = devices
+            .iter()
+            .map(|(_, name)| name.as_deref())
+            .collect::<Vec<_>>();
+        let index = resolve_device(direction, id, &names)?;
+        devices
+            .into_iter()
+            .nth(index)
+            .map(|(device, _)| device)
+            .ok_or_else(|| device_unavailable("O dispositivo salvo não foi encontrado."))
     }
     fn input_stream<T>(
         device: &cpal::Device,
@@ -565,6 +663,148 @@ mod tests {
         missing_fmt.extend(4u32.to_le_bytes());
         missing_fmt.extend([0; 4]);
         assert!(decode_wav_pcm16(&missing_fmt, 24000).is_err());
+    }
+
+    fn name_list<'a>(names: &'a [&'a str]) -> Vec<Option<&'a str>> {
+        names.iter().map(|name| Some(*name)).collect()
+    }
+
+    #[test]
+    fn ids_roundtrip_escaped_and_unicode_names_in_both_directions() {
+        for direction in ["input", "output"] {
+            for name in [
+                "Microfone \"USB\" C3",
+                "Backslash \\ interno",
+                "Caixa d'água · Fone — ação",
+                "v1:[\"input\",\"Fone\"]",
+                "日本語マイク",
+                "Fone, com vírgulas",
+            ] {
+                let id = device_id(direction, name);
+                assert_eq!(
+                    parse_device_id(&id).unwrap(),
+                    DeviceId {
+                        direction: direction.into(),
+                        name: name.into(),
+                    }
+                );
+                let listed = ["Outro", name, "Terceiro"];
+                assert_eq!(
+                    resolve_device(direction, &id, &name_list(&listed)).unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_ids_survive_enumeration_reorder() {
+        for direction in ["input", "output"] {
+            let first = ["Fone USB", "Microfone interno"];
+            let id = device_id(direction, "Microfone interno");
+            assert_eq!(
+                resolve_device(direction, &id, &name_list(&first)).unwrap(),
+                1
+            );
+            let reordered = ["Microfone interno", "Fone USB"];
+            assert_eq!(
+                resolve_device(direction, &id, &name_list(&reordered)).unwrap(),
+                0
+            );
+            assert!(resolve_device(direction, "input:1", &name_list(&reordered)).is_err());
+            assert!(resolve_device(direction, "output:0", &name_list(&reordered)).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_duplicate_and_unreadable_names_fail_closed() {
+        for direction in ["input", "output"] {
+            let id = device_id(direction, "Fone");
+            for listed in [&[][..], &["Outro"][..]] {
+                let error = resolve_device(direction, &id, &name_list(listed)).unwrap_err();
+                assert_eq!(error.code, "DEVICE_UNAVAILABLE");
+                assert!(error.message.contains("Selecione novamente"));
+            }
+            let duplicate =
+                resolve_device(direction, &id, &name_list(&["Fone", "Fone"])).unwrap_err();
+            assert_eq!(duplicate.code, "DEVICE_UNAVAILABLE");
+            assert!(duplicate.message.contains("Selecione novamente"));
+            assert!(resolve_device(direction, &id, &[None]).is_err());
+            assert!(resolve_device(direction, &id, &[Some("Fone"), None]).is_err());
+        }
+    }
+
+    #[test]
+    fn unreadable_and_duplicated_names_are_not_offered() {
+        let names = [
+            Some("Fone".to_string()),
+            None,
+            Some("Caixa".to_string()),
+            Some("Caixa".to_string()),
+            Some("Teclado".to_string()),
+        ];
+        assert_eq!(unique_device_names(&names), vec!["Fone", "Teclado"]);
+        assert!(unique_device_names(&[None, None]).is_empty());
+        assert_eq!(
+            unique_device_names(&[Some("A".into()), Some("B".into())]),
+            vec!["A", "B"]
+        );
+    }
+
+    #[test]
+    fn wrong_direction_is_rejected() {
+        let listed = name_list(&["Fone"]);
+        let output = device_id("output", "Fone");
+        let error = resolve_device("input", &output, &listed).unwrap_err();
+        assert_eq!(error.code, "DEVICE_UNAVAILABLE");
+        assert!(error.message.contains("Selecione novamente"));
+        assert_eq!(resolve_device("output", &output, &listed).unwrap(), 0);
+        let input = device_id("input", "Fone");
+        assert!(resolve_device("output", &input, &listed).is_err());
+    }
+
+    #[test]
+    fn malformed_and_legacy_ids_are_rejected_with_reselection_guidance() {
+        let listed = name_list(&["Fone"]);
+        for id in [
+            "",
+            "input:0",
+            "output:1",
+            "v1:",
+            "v1:[]",
+            "v1:{}",
+            "v1:\"Fone\"",
+            "v1:[\"input\"]",
+            "v1:[\"input\",\"Fone\",\"extra\"]",
+            "v1:[1,2]",
+            "v1:[\"input\",null]",
+            "v1:[\"\",\"Fone\"]",
+            "v1:[\"input\",\"\"]",
+            "v2:[\"input\",\"Fone\"]",
+        ] {
+            for direction in ["input", "output"] {
+                let error = resolve_device(direction, id, &listed).unwrap_err();
+                assert_eq!(error.code, "DEVICE_UNAVAILABLE", "{id}");
+                assert!(error.message.contains("Selecione novamente"), "{id}");
+            }
+        }
+        assert_eq!(
+            parse_device_id("v1:[\"input\",\"Fone\"]").unwrap().name,
+            "Fone"
+        );
+    }
+
+    #[test]
+    fn no_saved_value_ever_falls_back_to_the_system_default() {
+        let listed = name_list(&["Fone"]);
+        for id in ["", "input:0", "v1:[\"input\",\"Outro\"]"] {
+            for direction in ["input", "output"] {
+                assert!(resolve_device(direction, id, &listed).is_err(), "{id}");
+            }
+        }
+        let output = "v1:[\"output\",\"Fone\"]";
+        assert!(resolve_device("input", output, &listed).is_err());
+        assert_eq!(resolve_device("output", output, &listed).unwrap(), 0);
     }
 
     #[cfg(feature = "native-audio")]

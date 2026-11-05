@@ -51,15 +51,40 @@ pub(crate) async fn answer(
         messages.push(json!({"role":"assistant","content":format!("Dados da proposta anterior (não confirmada ou de resultado pendente): {}",serde_json::to_string(&op)?)}));
     }
     let recent = database(&runtime.db)?.recent_messages(emitter.session, 20)?;
+    let current = recent
+        .iter()
+        .rposition(|m| m.role == "user")
+        .map(|index| (recent[index].id, recent[index].text.as_str()))
+        .ok_or_else(|| {
+            AppError::new(
+                "INTERNAL",
+                "Histórico inconsistente: mensagem atual ausente da conversa",
+            )
+        })?;
+    if current.1 != text {
+        return Err(AppError::new(
+            "INTERNAL",
+            "Histórico inconsistente: mensagem atual não corresponde ao pedido",
+        ));
+    }
     let mut budget = (settings.provider.context_tokens as usize * 2)
         .saturating_sub(8000)
         .max(2000);
     let mut history = Vec::new();
+    let mut reached_current = false;
     for msg in recent
         .iter()
         .rev()
         .filter(|m| ["user", "assistant"].contains(&m.role.as_str()))
     {
+        if msg.id == current.0 {
+            history.push(json!({"role":"user","content":text}));
+            reached_current = true;
+            continue;
+        }
+        if !reached_current {
+            continue;
+        }
         let content = clip(&msg.text, budget.min(8000));
         if content.is_empty() {
             break;
@@ -112,6 +137,7 @@ async fn rounds(
             messages.push(json!({"role":"system","content":"Responda agora com o que foi obtido; não há mais ferramentas nesta resposta."}));
         }
         let space = !answer.is_empty() && !answer.ends_with(char::is_whitespace);
+        emitter.trace("provider_round_start", Some(messages.len()), None, None);
         let response = stream_round(
             provider,
             messages.clone(),
@@ -205,13 +231,16 @@ async fn stream_round(
     let cancel = emitter.cancel.clone();
     let provider = provider.clone();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
+    let request_messages = messages.len();
+    let (response, deltas) = tokio::task::spawn_blocking(move || {
         let mut sentences = Sentences::default();
         let mut first = space;
+        let mut deltas = 0usize;
         let response = handle.block_on(provider.chat(&messages, &tools, None, &cancel, |delta| {
             if delta.is_empty() {
                 return;
             }
+            deltas += 1;
             let text = if first {
                 first = false;
                 format!(" {delta}")
@@ -233,10 +262,17 @@ async fn stream_round(
             }
         }
         drop(tx);
-        response
+        (response, deltas)
     })
     .await
-    .map_err(|_| AppError::new("PROVIDER_ERROR", "Geração interrompida"))?
+    .map_err(|_| AppError::new("PROVIDER_ERROR", "Geração interrompida"))?;
+    emitter.trace(
+        "provider_round_end",
+        Some(request_messages),
+        Some(deltas),
+        response.as_ref().err().map(|error| error.code.as_str()),
+    );
+    response
 }
 
 async fn run_call(
@@ -371,6 +407,39 @@ mod tests {
         }
     }
 
+    struct HugeTool;
+
+    #[async_trait::async_trait]
+    impl Integration for HugeTool {
+        fn manifest(&self) -> IntegrationManifest {
+            IntegrationManifest {
+                id: "huge".into(),
+                name: "Ferramenta sintética".into(),
+                description: "Ocupa o orçamento de contexto".into(),
+                documentation: vec![],
+                builtin: true,
+            }
+        }
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "huge_lookup".into(),
+                label: "Consultando".into(),
+                description: "descrição sintética ".repeat(4000),
+                parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                effect: Effect::Read,
+                integration: "huge".into(),
+            }]
+        }
+        async fn execute(
+            &self,
+            _name: &str,
+            _args: Value,
+            _ctx: &ToolContext<'_>,
+        ) -> Result<Value> {
+            Ok(json!({}))
+        }
+    }
+
     fn test_paths(dir: &std::path::Path) -> Paths {
         Paths {
             data: dir.join("data"),
@@ -411,10 +480,11 @@ mod tests {
             .unwrap();
     }
 
-    async fn ready_runtime(
+    async fn open_runtime(
         dir: &std::path::Path,
         base_url: &str,
         extra: Option<Arc<dyn Integration>>,
+        context_tokens: u32,
     ) -> (Arc<Runtime>, i64) {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut runtime = Runtime::open(Paths::new(dir.into(), root)).unwrap();
@@ -428,6 +498,7 @@ mod tests {
         settings.provider.kind = ProviderKind::CompatibleApi;
         settings.provider.base_url = base_url.into();
         settings.provider.model = "modelo".into();
+        settings.provider.context_tokens = context_tokens;
         settings.speak_text = false;
         runtime
             .save_settings(settings.clone(), None, None, None)
@@ -435,6 +506,15 @@ mod tests {
             .unwrap();
         store_probe(&runtime, &settings);
         let session = runtime.session_create("t").unwrap().id;
+        (runtime, session)
+    }
+
+    async fn ready_runtime(
+        dir: &std::path::Path,
+        base_url: &str,
+        extra: Option<Arc<dyn Integration>>,
+    ) -> (Arc<Runtime>, i64) {
+        let (runtime, session) = open_runtime(dir, base_url, extra, 8192).await;
         database(&runtime.db)
             .unwrap()
             .append(session, "user", "pergunta")
@@ -526,6 +606,52 @@ mod tests {
         let delta = json!({"choices":[{"delta":{"content":text},"finish_reason":null}]});
         let stop = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
         format!("data: {delta}\n\ndata: {stop}\n\ndata: [DONE]\n\n")
+    }
+
+    fn sse_deltas(deltas: &[&str]) -> String {
+        let mut payload = String::new();
+        for text in deltas {
+            let delta = json!({"choices":[{"delta":{"content":text},"finish_reason":null}]});
+            payload.push_str(&format!("data: {delta}\n\n"));
+        }
+        let stop = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+        payload.push_str(&format!("data: {stop}\n\ndata: [DONE]\n\n"));
+        payload
+    }
+
+    fn event_sink() -> (
+        EventSink,
+        Arc<Mutex<Vec<AppEvent>>>,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&events);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: EventSink = Arc::new(move |event| {
+            let _ = tx.send(event.clone());
+            output.lock().unwrap().push(event);
+        });
+        (sink, events, rx)
+    }
+
+    async fn wait_for_run(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("tempo esgotado aguardando run.completed")
+                .expect("canal de eventos encerrado");
+            if event.kind == "run.completed" {
+                return;
+            }
+        }
+    }
+
+    fn event_text(events: &[&AppEvent], kind: &str) -> String {
+        events
+            .iter()
+            .filter(|event| event.kind == kind)
+            .filter_map(|event| event.payload["text"].as_str())
+            .collect()
     }
 
     fn sse_calls(calls: &[(&str, &str, &str)]) -> String {
@@ -748,5 +874,343 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "ACTION_AMBIGUOUS");
         assert_eq!(fake.prepared.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_text_turns_stream_persist_and_replay_only_own_content() {
+        let first = "Explique o mesmo trecho repetido.";
+        let second = "Repita o mesmo trecho repetido, por favor.";
+        let first_deltas = [
+            "Primeira resposta. ",
+            "Mesmo trecho ",
+            "repetido. ",
+            "Mesmo trecho repetido.",
+        ];
+        let second_deltas = ["Segunda resposta. ", "Mesmo trecho ", "repetido."];
+        let first_answer = first_deltas.concat();
+        let second_answer = second_deltas.concat();
+        let (port, bodies) = spawn_provider(move |index, _| match index {
+            0 => sse_calls(&[("c1", "memory_search", r#"{"query":"mesmo trecho"}"#)]),
+            1 => sse_deltas(&first_deltas),
+            _ => sse_deltas(&second_deltas),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, session) = open_runtime(
+            directory.path(),
+            &format!("http://127.0.0.1:{port}/v1"),
+            None,
+            8192,
+        )
+        .await;
+        let (sink, events, mut rx) = event_sink();
+        let first_ticket = runtime
+            .start(session, Some(first.to_string()), sink.clone())
+            .await
+            .unwrap();
+        wait_for_run(&mut rx).await;
+        let second_ticket = runtime
+            .start(session, Some(second.to_string()), sink)
+            .await
+            .unwrap();
+        wait_for_run(&mut rx).await;
+
+        assert_eq!(first_ticket.session_id, session);
+        assert_eq!(second_ticket.session_id, session);
+        assert_ne!(first_ticket.turn_id, second_ticket.turn_id);
+        assert_ne!(first_ticket.generation, second_ticket.generation);
+        assert!(second_ticket.generation > first_ticket.generation);
+
+        let events = events.lock().unwrap();
+        let first_events: Vec<&AppEvent> = events
+            .iter()
+            .filter(|event| event.turn_id == first_ticket.turn_id)
+            .collect();
+        let second_events: Vec<&AppEvent> = events
+            .iter()
+            .filter(|event| event.turn_id == second_ticket.turn_id)
+            .collect();
+        for turn in [&first_events, &second_events] {
+            assert!(!turn.is_empty());
+            assert_eq!(
+                turn.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+                (0..turn.len() as u64).collect::<Vec<_>>()
+            );
+            assert_eq!(turn.first().unwrap().kind, "run.started");
+            assert_eq!(turn.last().unwrap().kind, "run.completed");
+        }
+        assert_eq!(event_text(&first_events, "assistant.delta"), first_answer);
+        assert_eq!(event_text(&second_events, "assistant.delta"), second_answer);
+        assert!(!event_text(&second_events, "assistant.delta").contains(&first_answer));
+        let first_at = |kind: &str| {
+            first_events
+                .iter()
+                .position(|event| event.kind == kind)
+                .unwrap_or_else(|| panic!("evento {kind} ausente no primeiro turno"))
+        };
+        assert!(first_at("transcript.final") < first_at("tool.started"));
+        assert!(first_at("tool.started") < first_at("tool.completed"));
+        assert!(first_at("tool.completed") < first_at("assistant.delta"));
+        let last_delta = first_events
+            .iter()
+            .rposition(|event| event.kind == "assistant.delta")
+            .unwrap();
+        assert!(last_delta < first_at("turn.completed"));
+        assert!(first_at("turn.completed") < first_at("run.completed"));
+        let completed = first_events
+            .iter()
+            .find(|event| event.kind == "turn.completed")
+            .unwrap();
+        assert_eq!(completed.payload["text"], first_answer);
+        let completed = second_events
+            .iter()
+            .find(|event| event.kind == "turn.completed")
+            .unwrap();
+        assert_eq!(completed.payload["text"], second_answer);
+        drop(events);
+
+        let stored = database(&runtime.db).unwrap().messages(session).unwrap();
+        assert_eq!(
+            stored.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            ["user", "tool", "assistant", "user", "assistant"]
+        );
+        assert_eq!(stored[0].text, first);
+        assert_eq!(stored[2].text, first_answer);
+        assert_eq!(stored[3].text, second);
+        assert_eq!(stored[4].text, second_answer);
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3);
+        let initial = bodies[0]["messages"].as_array().unwrap();
+        let users: Vec<_> = initial
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0]["content"], first);
+        assert_eq!(initial.last().unwrap()["content"], first);
+        let after_tool = bodies[1]["messages"].as_array().unwrap();
+        let users: Vec<_> = after_tool
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0]["content"], first);
+        let assistant = after_tool
+            .iter()
+            .find(|message| message["tool_calls"].is_array())
+            .expect("assistant com tool_calls");
+        assert_eq!(assistant["tool_calls"][0]["id"], "c1");
+        let tool = after_tool
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("resultado de ferramenta");
+        assert_eq!(tool["tool_call_id"], "c1");
+        assert_eq!(tool["name"], "memory_search");
+        let second_initial = bodies[2]["messages"].as_array().unwrap();
+        let users: Vec<_> = second_initial
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .collect();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0]["content"], first);
+        assert_eq!(users[1]["content"], second);
+        let assistants: Vec<_> = second_initial
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0]["content"], first_answer);
+        assert!(
+            !second_initial
+                .iter()
+                .any(|message| message["content"] == second_answer)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn long_multibyte_current_input_reaches_provider_intact_under_pressure() {
+        let (port, bodies) = spawn_provider(|_, _| sse_deltas(&["Resposta curta."]));
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, session) = open_runtime(
+            directory.path(),
+            &format!("http://127.0.0.1:{port}/v1"),
+            None,
+            16384,
+        )
+        .await;
+        {
+            let db = database(&runtime.db).unwrap();
+            for index in 0..8 {
+                let role = if index % 2 == 0 { "user" } else { "assistant" };
+                db.append(
+                    session,
+                    role,
+                    &format!("historico-{index} {}", "á".repeat(6200)),
+                )
+                .unwrap();
+            }
+        }
+        let current = format!("{}{}", "a".repeat(10500), "á".repeat(500));
+        assert!(current.len() > 8000 && current.len() <= 12000);
+        let (sink, events, mut rx) = event_sink();
+        runtime
+            .start(session, Some(current.clone()), sink)
+            .await
+            .unwrap();
+        wait_for_run(&mut rx).await;
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "error")
+        );
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let messages = bodies[0]["messages"].as_array().unwrap();
+        let latest_user = messages
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .expect("mensagem atual");
+        assert_eq!(latest_user["content"], current.as_str());
+        assert_eq!(
+            messages
+                .iter()
+                .filter(
+                    |message| message["role"] == "user" && message["content"] == current.as_str()
+                )
+                .count(),
+            1
+        );
+        let mut retained = Vec::new();
+        for message in messages {
+            let Some(content) = message["content"].as_str() else {
+                continue;
+            };
+            let Some(rest) = content.strip_prefix("historico-") else {
+                continue;
+            };
+            if let Some(index) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                retained.push(index);
+            }
+        }
+        assert!(
+            !retained.is_empty(),
+            "o histórico recente deveria permanecer: {retained:?}"
+        );
+        assert!(
+            retained.len() < 8,
+            "a pressão de contexto deveria remover histórico antigo: {retained:?}"
+        );
+        assert_eq!(retained.last(), Some(&7));
+        assert_eq!(retained, (retained[0]..=7).collect::<Vec<_>>());
+        assert!(
+            retained[0] > 0,
+            "o histórico mais antigo deveria sair primeiro"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn oversized_current_input_fails_with_context_limit_before_http() {
+        let (port, bodies) = spawn_provider(|_, _| sse_deltas(&["não deveria ser enviado"]));
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, session) = open_runtime(
+            directory.path(),
+            &format!("http://127.0.0.1:{port}/v1"),
+            Some(Arc::new(HugeTool) as Arc<dyn Integration>),
+            8192,
+        )
+        .await;
+        let current = "a".repeat(12000);
+        let (sink, events, mut rx) = event_sink();
+        let ticket = runtime.start(session, Some(current), sink).await.unwrap();
+        wait_for_run(&mut rx).await;
+        assert!(bodies.lock().unwrap().is_empty());
+        let events = events.lock().unwrap();
+        let error = events
+            .iter()
+            .find(|event| event.kind == "error")
+            .expect("erro do turno");
+        assert_eq!(error.payload["code"], "CONTEXT_LIMIT");
+        assert_eq!(error.turn_id, ticket.turn_id);
+        assert!(!events.iter().any(|event| event.kind == "assistant.delta"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sentence_queue_matches_round_deltas_and_tool_boundaries() {
+        let final_deltas = [
+            "Uma frase longa o suficiente para passar do limite de quarenta e cinco. ",
+            "Trecho igual. ",
+            "Trecho igual.",
+            " Fim.",
+        ];
+        let (port, bodies) = spawn_provider(move |index, _| match index {
+            0 => sse_calls(&[("c1", "memory_search", r#"{"query":"trecho"}"#)]),
+            _ => sse_deltas(&final_deltas),
+        });
+        let provider = Arc::new(Provider {
+            client: reqwest::Client::new(),
+            config: crate::config::ProviderConfig {
+                kind: ProviderKind::CompatibleApi,
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model: "modelo".into(),
+                context_tokens: 8192,
+            },
+            key: None,
+        });
+        let events = Arc::new(Mutex::new(Vec::<AppEvent>::new()));
+        let output = Arc::clone(&events);
+        let event = emitter(
+            1,
+            CancellationToken::new(),
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let tool_round = stream_round(
+            &provider,
+            vec![json!({"role":"user","content":"pedido"})],
+            vec![],
+            &event,
+            Some(tx),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tool_round.calls.len(), 1);
+        assert!(tool_round.text.is_empty());
+        let mut tool_queue = Vec::new();
+        while let Some(sentence) = rx.recv().await {
+            tool_queue.push(sentence);
+        }
+        assert!(
+            tool_queue.is_empty(),
+            "rodada de ferramenta não enfileira texto: {tool_queue:?}"
+        );
+        let messages = vec![
+            json!({"role":"user","content":"pedido"}),
+            assistant_tools(&tool_round),
+            json!({"role":"tool","tool_call_id":"c1","name":"memory_search","content":"{\"sources\":[]}"}),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let final_round = stream_round(&provider, messages, vec![], &event, Some(tx), false)
+            .await
+            .unwrap();
+        assert!(final_round.calls.is_empty());
+        assert_eq!(final_round.text, final_deltas.concat());
+        let mut queue = Vec::new();
+        while let Some(sentence) = rx.recv().await {
+            queue.push(sentence);
+        }
+        assert!(queue.len() > 1);
+        assert_eq!(queue.concat(), final_deltas.concat());
+        let events = events.lock().unwrap();
+        let deltas = event_text(&events.iter().collect::<Vec<_>>(), "assistant.delta");
+        assert_eq!(deltas, final_deltas.concat());
+        assert_eq!(bodies.lock().unwrap().len(), 2);
     }
 }
